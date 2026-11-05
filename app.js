@@ -388,11 +388,25 @@ function normalizedGradeHue(hue) {
 }
 
 const GRADE_WHEEL_MARKER_RADIUS = 0.425;
+const GRADE_WHEEL_MARKER_HIT_RADIUS_PX = 6;
 
 function gradeWheelMarkerPosition(hue, saturation) {
   const angle = normalizedGradeHue(hue) * Math.PI / 180;
   const radius = GRADE_WHEEL_MARKER_RADIUS * Math.max(0, Math.min(100, Number(saturation) || 0)) / 100;
   return { x: 0.5 + Math.sin(angle) * radius, y: 0.5 - Math.cos(angle) * radius };
+}
+
+function gradeWheelPointFromClient(clientX, clientY, rect, metrics) {
+  const size = Math.min(metrics.width, metrics.height);
+  if (!size) return { x: 0.5, y: 0.5 };
+  const left = rect.left + metrics.borderLeft + (metrics.width - size) / 2;
+  const top = rect.top + metrics.borderTop + (metrics.height - size) / 2;
+  return { x: (clientX - left) / size, y: (clientY - top) / size };
+}
+
+function gradeWheelPointerHitsMarker(point, hue, saturation, size) {
+  const marker = gradeWheelMarkerPosition(hue, saturation);
+  return Math.hypot((point.x - marker.x) * size, (point.y - marker.y) * size) <= GRADE_WHEEL_MARKER_HIT_RADIUS_PX;
 }
 
 function gradeWheelValuesAtPoint(x, y, previousHue = 0) {
@@ -497,17 +511,22 @@ function gradeWheelControls(parent) {
     let pointerId = null;
     const updateFromPointer = (event) => {
       const rect = wheel.getBoundingClientRect();
-      const size = Math.min(rect.width, rect.height);
-      if (!size) return;
-      const left = rect.left + (rect.width - size) / 2;
-      const top = rect.top + (rect.height - size) / 2;
-      const values = gradeWheelValuesAtPoint(
-        (event.clientX - left) / size,
-        (event.clientY - top) / size,
-        currentPhoto()?.settings[band + "Hue"] ?? defaults[band + "Hue"]
-      );
+      const point = gradeWheelPointFromClient(event.clientX, event.clientY, rect, {
+        borderLeft: wheel.clientLeft,
+        borderTop: wheel.clientTop,
+        width: wheel.clientWidth,
+        height: wheel.clientHeight
+      });
       const photo = currentPhoto();
       if (!photo) return;
+      const currentHue = photo.settings[band + "Hue"] ?? defaults[band + "Hue"];
+      const currentSaturation = photo.settings[band + "Sat"] ?? defaults[band + "Sat"];
+      if (event.type === "pointerdown" && gradeWheelPointerHitsMarker(point, currentHue, currentSaturation, Math.min(wheel.clientWidth, wheel.clientHeight))) return;
+      const values = gradeWheelValuesAtPoint(
+        point.x,
+        point.y,
+        currentHue
+      );
       if (photo.settings[band + "Hue"] !== values.hue) setControl(band + "Hue", values.hue);
       if (photo.settings[band + "Sat"] !== values.saturation) setControl(band + "Sat", values.saturation);
     };

@@ -23,7 +23,7 @@ vm.runInContext(source.slice(0, boundary) + `
       actualZoom = true;
       fullOriginal = { width, height, compositionKey: JSON.stringify(photoComposition()) };
     },
-    centeredCropForAspect, resizeCropCorner, gradeWheelMarkerPosition, gradeWheelValuesAtPoint, sourcePointToOutput,
+    centeredCropForAspect, resizeCropCorner, gradeWheelMarkerPosition, gradeWheelPointerHitsMarker, gradeWheelPointFromClient, gradeWheelValuesAtPoint, sourcePointToOutput,
     outputPointToSource, sourceToOutputMatrix, cropPointToScreen,
     screenPointToCrop, rotatedDimensions
   };
@@ -41,9 +41,22 @@ assert.deepEqual(Array.from(api.sourceToOutputMatrix()), [1, 0, 0, 1, 0, 0]);
 for (const hue of [0, 30, 90, 180, 240, 315]) {
   for (const saturation of [0, 1, 50, 83, 100]) {
     const marker = api.gradeWheelMarkerPosition(hue, saturation);
-    const values = api.gradeWheelValuesAtPoint(marker.x, marker.y, hue);
+    const rect = { left: 17, top: 29, width: 114, height: 114 };
+    const metrics = { borderLeft: 1, borderTop: 1, width: 112, height: 112 };
+    const click = api.gradeWheelPointFromClient(
+      rect.left + metrics.borderLeft + marker.x * metrics.width,
+      rect.top + metrics.borderTop + marker.y * metrics.height,
+      rect,
+      metrics
+    );
+    near(click.x, marker.x, "border-box marker click x");
+    near(click.y, marker.y, "border-box marker click y");
+    const values = api.gradeWheelValuesAtPoint(click.x, click.y, hue);
     assert.equal(values.hue, hue, "marker click preserves hue");
     assert.equal(values.saturation, saturation, `marker click preserves ${hue}°/${saturation}%`);
+    const roundedPixelClick = { x: click.x + 0.5 / metrics.width, y: click.y - 0.5 / metrics.height };
+    assert.equal(api.gradeWheelPointerHitsMarker(roundedPixelClick, hue, saturation, metrics.width), true,
+      `pixel-rounded click on ${hue}°/${saturation}% marker is treated as the same marker`);
   }
 }
 
