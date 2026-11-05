@@ -169,8 +169,8 @@ class WhiteBalanceApiTests(unittest.TestCase):
 
     def test_clipped_or_over_saturated_samples_return_exact_http_400_error(self):
         invalid_colors = (
-            (5, 128, 128),       # Median channel at the lower clipping threshold.
-            (250, 128, 128),     # Median channel at the upper clipping threshold.
+            (5, 5, 5),           # Lower clipping threshold, without a color cast.
+            (250, 250, 250),     # Upper clipping threshold, without a color cast.
             (200, 89, 90),       # (max - min) / max is greater than 0.55.
         )
         for color in invalid_colors:

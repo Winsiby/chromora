@@ -520,6 +520,8 @@ def estimate_white_balance(rgb, x, y):
             (brightest - darkest) / max(brightest, 1e-9) > 0.55):
         raise ValueError("取样区域过亮、过暗或颜色过饱和，请点击未剪切的中性灰或白色区域。")
 
+    # `_adjust` applies temperature gains in linear-light RGB, then converts
+    # back to sRGB before the tint control runs.
     linear = np.where(sample <= 0.04045, sample / 12.92,
                       ((sample + 0.055) / 1.055) ** 2.4)
     red_blue_ratio = max(float(linear[0]), 1e-9) / max(float(linear[2]), 1e-9)
