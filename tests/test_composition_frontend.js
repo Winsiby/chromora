@@ -23,7 +23,7 @@ vm.runInContext(source.slice(0, boundary) + `
       actualZoom = true;
       fullOriginal = { width, height, compositionKey: JSON.stringify(photoComposition()) };
     },
-    centeredCropForAspect, resizeCropCorner, sourcePointToOutput,
+    centeredCropForAspect, resizeCropCorner, gradeWheelMarkerPosition, gradeWheelValuesAtPoint, sourcePointToOutput,
     outputPointToSource, sourceToOutputMatrix, cropPointToScreen,
     screenPointToCrop, rotatedDimensions
   };
@@ -37,6 +37,15 @@ const pointNear = (actual, expected, message) => {
 };
 api.setComposition(defaults);
 assert.deepEqual(Array.from(api.sourceToOutputMatrix()), [1, 0, 0, 1, 0, 0]);
+
+for (const hue of [0, 30, 90, 180, 240, 315]) {
+  for (const saturation of [0, 1, 50, 83, 100]) {
+    const marker = api.gradeWheelMarkerPosition(hue, saturation);
+    const values = api.gradeWheelValuesAtPoint(marker.x, marker.y, hue);
+    assert.equal(values.hue, hue, "marker click preserves hue");
+    assert.equal(values.saturation, saturation, `marker click preserves ${hue}°/${saturation}%`);
+  }
+}
 
 for (const rotation of [0, 90, 180, 270]) {
   const composition = { ...defaults, rotation };

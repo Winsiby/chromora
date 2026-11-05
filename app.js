@@ -387,9 +387,11 @@ function normalizedGradeHue(hue) {
   return ((numeric % 360) + 360) % 360;
 }
 
+const GRADE_WHEEL_MARKER_RADIUS = 0.425;
+
 function gradeWheelMarkerPosition(hue, saturation) {
   const angle = normalizedGradeHue(hue) * Math.PI / 180;
-  const radius = 0.425 * Math.max(0, Math.min(100, Number(saturation) || 0)) / 100;
+  const radius = GRADE_WHEEL_MARKER_RADIUS * Math.max(0, Math.min(100, Number(saturation) || 0)) / 100;
   return { x: 0.5 + Math.sin(angle) * radius, y: 0.5 - Math.cos(angle) * radius };
 }
 
@@ -400,7 +402,7 @@ function gradeWheelValuesAtPoint(x, y, previousHue = 0) {
   const hue = distance < 0.005
     ? normalizedGradeHue(previousHue)
     : Math.round(normalizedGradeHue(Math.atan2(dx, -dy) * 180 / Math.PI)) % 360;
-  return { hue, saturation: Math.round(distance * 200) };
+  return { hue, saturation: Math.max(0, Math.min(100, Math.round(distance / GRADE_WHEEL_MARKER_RADIUS * 100))) };
 }
 
 function gradeNumberField(band, key, label, unit) {
