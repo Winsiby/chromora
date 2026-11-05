@@ -16,6 +16,14 @@ PREVIEW_EDGE = 1440
 SRGB_PROFILE = ImageCms.createProfile("sRGB")
 SRGB_ICC = ImageCms.ImageCmsProfile(SRGB_PROFILE).tobytes()
 LUMA = np.array((0.2126, 0.7152, 0.0722), dtype=np.float32)
+MASK_ADJUSTMENTS = {
+    "exposure": (-3, 3),
+    "highlights": (-100, 100),
+    "shadows": (-100, 100),
+    "temperature": (-100, 100),
+    "saturation": (-100, 100),
+}
+MAX_MASKS = 100
 
 
 def _number(settings, key, low, high, default=0.0):
@@ -23,6 +31,144 @@ def _number(settings, key, low, high, default=0.0):
     if type(value) not in (int, float) or not math.isfinite(value):
         raise ValueError(f"{key} 的数值无效")
     return min(high, max(low, value))
+
+
+def _unit_value(value, label):
+    if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+        raise ValueError(f"{label} 必须是 0 到 1 之间的有限数值")
+    return float(value)
+
+
+def validate_masks(masks):
+    """Validate and normalize a photo's editable local-mask settings."""
+    if not isinstance(masks, list) or len(masks) > MAX_MASKS:
+        raise ValueError(f"蒙版列表必须是数组，且每张照片不能超过 {MAX_MASKS} 个")
+
+    result = []
+    seen_ids = set()
+    for index, mask in enumerate(masks):
+        if not isinstance(mask, dict):
+            raise ValueError(f"第 {index + 1} 个蒙版格式无效")
+        mask_id = mask.get("id")
+        if not isinstance(mask_id, str) or not mask_id.strip() or len(mask_id) > 80:
+            raise ValueError(f"第 {index + 1} 个蒙版标识无效")
+        if mask_id in seen_ids:
+            raise ValueError("蒙版标识不能重复")
+        seen_ids.add(mask_id)
+
+        name = mask.get("name", f"蒙版 {index + 1}")
+        if not isinstance(name, str) or not name.strip() or len(name) > 80:
+            raise ValueError(f"第 {index + 1} 个蒙版名称无效")
+        kind = mask.get("type")
+        if kind not in ("linear", "radial"):
+            raise ValueError(f"蒙版类型无效：{name}")
+        enabled = mask.get("enabled", True)
+        invert = mask.get("invert", False)
+        if type(enabled) is not bool or type(invert) is not bool:
+            raise ValueError(f"蒙版开关格式无效：{name}")
+
+        geometry = mask.get("geometry")
+        if not isinstance(geometry, dict):
+            raise ValueError(f"蒙版几何参数无效：{name}")
+        if kind == "linear":
+            start, end = geometry.get("start"), geometry.get("end")
+            if not isinstance(start, dict) or not isinstance(end, dict):
+                raise ValueError(f"线性蒙版端点无效：{name}")
+            normalized_geometry = {
+                "start": {axis: _unit_value(start.get(axis), f"{name} 起点") for axis in ("x", "y")},
+                "end": {axis: _unit_value(end.get(axis), f"{name} 终点") for axis in ("x", "y")},
+            }
+            dx = normalized_geometry["end"]["x"] - normalized_geometry["start"]["x"]
+            dy = normalized_geometry["end"]["y"] - normalized_geometry["start"]["y"]
+            if dx * dx + dy * dy < 1e-8:
+                raise ValueError(f"线性蒙版两端不能重合：{name}")
+        else:
+            center, radius = geometry.get("center"), geometry.get("radius")
+            if not isinstance(center, dict) or not isinstance(radius, dict):
+                raise ValueError(f"径向蒙版中心或半径无效：{name}")
+            normalized_geometry = {
+                "center": {axis: _unit_value(center.get(axis), f"{name} 中心") for axis in ("x", "y")},
+                "radius": {axis: _unit_value(radius.get(axis), f"{name} 半径") for axis in ("x", "y")},
+            }
+            if min(normalized_geometry["radius"].values()) < 1e-4:
+                raise ValueError(f"径向蒙版半径不能为零或过小：{name}")
+
+        feather = _unit_value(mask.get("feather", 0), f"{name} 羽化")
+        adjustments = mask.get("adjustments", {})
+        if not isinstance(adjustments, dict) or set(adjustments) - set(MASK_ADJUSTMENTS):
+            raise ValueError(f"蒙版局部参数无效：{name}")
+        normalized_adjustments = {
+            key: _number(adjustments, key, low, high)
+            for key, (low, high) in MASK_ADJUSTMENTS.items()
+        }
+        result.append({
+            "id": mask_id,
+            "name": name.strip(),
+            "type": kind,
+            "enabled": enabled,
+            "geometry": normalized_geometry,
+            "feather": feather,
+            "invert": invert,
+            "adjustments": normalized_adjustments,
+        })
+    return result
+
+
+def _mask_weight(mask, width, height, row_start=0, row_end=None):
+    """Return the mask opacity for a bounded image row range."""
+    row_end = height if row_end is None else row_end
+    x = (np.arange(width, dtype=np.float32) + 0.5) / width
+    y = (np.arange(row_start, row_end, dtype=np.float32) + 0.5) / height
+    geometry = mask["geometry"]
+
+    if mask["type"] == "linear":
+        start, end = geometry["start"], geometry["end"]
+        dx, dy = end["x"] - start["x"], end["y"] - start["y"]
+        distance = dx * dx + dy * dy
+        t = ((x[None, :] - start["x"]) * dx +
+             (y[:, None] - start["y"]) * dy) / distance
+        t = np.clip(t, 0, 1)
+        weight = 1 - t * t * (3 - 2 * t)
+    else:
+        center, radius = geometry["center"], geometry["radius"]
+        delta_x = x[None, :] * width - center["x"] * width
+        delta_y = y[:, None] * height - center["y"] * height
+        radius_x, radius_y = radius["x"] * width, radius["y"] * height
+        rho = np.sqrt((delta_x / radius_x) ** 2 + (delta_y / radius_y) ** 2)
+        if mask["feather"] == 0:
+            weight = (rho <= 1).astype(np.float32)
+        else:
+            radial_distance = np.sqrt(delta_x * delta_x + delta_y * delta_y)
+            fallback_radius = np.float32(min(radius_x, radius_y))
+            boundary_radius = np.divide(
+                radial_distance, rho,
+                out=np.full_like(rho, fallback_radius, dtype=np.float32),
+                where=rho > 1e-6,
+            )
+            feather_pixels = mask["feather"] * min(width, height)
+            depth = np.clip((1 - rho) * boundary_radius / feather_pixels, 0, 1)
+            weight = depth * depth * (3 - 2 * depth)
+
+    if mask["invert"]:
+        weight = 1 - weight
+    return np.asarray(weight, dtype=np.float32)
+
+
+def _apply_masks(rgb, masks):
+    for mask in masks:
+        if not mask["enabled"] or not any(mask["adjustments"].values()):
+            continue
+        height, width = rgb.shape[:2]
+        for row_start in range(0, height, 256):
+            row_end = min(height, row_start + 256)
+            weight = _mask_weight(mask, width, height, row_start, row_end)
+            if not np.any(weight):
+                continue
+            pixels = rgb[row_start:row_end]
+            adjusted = pixels.copy()
+            _adjust(adjusted, mask["adjustments"])
+            pixels += (adjusted - pixels) * weight[:, :, None]
+            np.clip(pixels, 0, 1, out=pixels)
 
 
 @lru_cache(maxsize=4)
@@ -326,6 +472,7 @@ def _retouch(rgb, settings):
 
 
 def render(path: Path, settings: dict, lut: Path | None, format: str, preview: bool = False) -> bytes:
+    masks = validate_masks(settings.get("masks", []))
     if preview:
         info = path.stat()
         rgb = _decode_preview(path, info.st_mtime_ns, info.st_size).copy()
@@ -335,6 +482,7 @@ def render(path: Path, settings: dict, lut: Path | None, format: str, preview: b
     apply_detail_tools(rgb, settings, preview)
     _retouch(rgb, settings)
     apply_color_tools(rgb, settings)
+    _apply_masks(rgb, masks)
     strength = _number(settings, "lutStrength", 0, 100, 100) / 100
     if lut and strength:
         table, lower, upper = _cube(lut)

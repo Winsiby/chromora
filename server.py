@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT / "vendor"))
 
 from PIL import Image, ImageCms
 from engine_adapters import capabilities, decode_raw, open_in_patchy
-from imaging import render, validate_lut
+from imaging import render, validate_lut, validate_masks
 
 DATA = ROOT / "数据"
 PHOTOS = DATA / "原片"
@@ -73,6 +73,19 @@ def original_path(photo_id: str) -> Path:
     if not path.is_file():
         raise FileNotFoundError("找不到工程里的照片，请重新导入原片。")
     return path
+
+
+def validate_project_state(state: dict) -> None:
+    photos = state.get("photos")
+    if not isinstance(photos, list):
+        raise ValueError("工程中的照片列表无效。")
+    for index, photo in enumerate(photos):
+        if not isinstance(photo, dict):
+            raise ValueError(f"工程中的第 {index + 1} 张照片数据无效。")
+        settings = photo.get("settings", {})
+        if not isinstance(settings, dict):
+            raise ValueError(f"工程中的第 {index + 1} 张照片调整参数无效。")
+        validate_masks(settings.get("masks", []))
 
 
 def render_source(photo_id: str) -> Path:
@@ -236,7 +249,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             path = project_path(query.get("name", ""))
             if not path.is_file():
                 raise FileNotFoundError("没有找到这个工程。")
-            self.json(json.loads(path.read_text(encoding="utf-8")))
+            stored = json.loads(path.read_text(encoding="utf-8"))
+            state = stored.get("state")
+            if not isinstance(state, dict):
+                raise ValueError("工程数据有误。")
+            validate_project_state(state)
+            self.json(stored)
         else:
             self.json({"error": "地址不存在。"}, HTTPStatus.NOT_FOUND)
 
@@ -265,6 +283,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             path = project_path(name)
             if not isinstance(state, dict):
                 raise ValueError("工程数据有误。")
+            validate_project_state(state)
             content = {"name": name.strip(), "state": state,
                        "updated": datetime.now().astimezone().isoformat(timespec="seconds")}
             atomic_write(path, json.dumps(content, ensure_ascii=False).encode())
@@ -380,4 +399,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
