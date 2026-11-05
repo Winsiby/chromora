@@ -581,6 +581,11 @@ function setControl(key, value) {
   schedulePreview();
 }
 
+function syncWorkspaceTitle() {
+  const photo = currentPhoto();
+  byId("workspace-title").textContent = photo ? byId("project-name").value + (dirty ? " •" : "") : "未打开照片";
+}
+
 function syncControls() {
   const photo = currentPhoto();
   const requiresRegion = capability?.portrait !== "rapidretouch";
@@ -604,7 +609,7 @@ function syncControls() {
   byId("region-caption").textContent = capability?.portrait === "rapidretouch"
     ? "可使用外部人像引擎。也可手动框选指定区域。"
     : "先框选皮肤区域，再调整下方滑杆。建议避开眼睛、嘴唇和头发。";
-  byId("workspace-title").textContent = photo ? byId("project-name").value + (dirty ? " •" : "") : "未打开照片";
+  syncWorkspaceTitle();
   byId("landscape-lut-name").textContent = preferences.luts.find((lut) => lut.id === photo?.lutId)?.name || "未应用滤镜";
   byId("export-open").disabled = !photo;
   if (byId("curve-section").open) drawCurve();
@@ -898,6 +903,7 @@ function renderMaskList() {
     enabled.addEventListener("click", () => {
       mask.enabled = !mask.enabled;
       dirty = true;
+      syncWorkspaceTitle();
       renderMaskList();
       syncMaskPanel();
       updateMaskOverlay();
@@ -915,6 +921,7 @@ function renderMaskList() {
       if (index >= 0) masks.splice(index, 1);
       if (selectedMaskId === mask.id) selectedMaskId = masks[Math.min(index, masks.length - 1)]?.id || null;
       dirty = true;
+      syncWorkspaceTitle();
       renderMaskList();
       syncMaskPanel();
       updateMaskOverlay();
@@ -992,6 +999,7 @@ function prepareMaskPanel() {
       selectedMaskId = mask.id;
       maskDrawType = type;
       dirty = true;
+      syncWorkspaceTitle();
       renderMaskList();
       syncMaskPanel();
       setStatus(type === "linear" ? "已添加线性渐变；在画布上拖动以设置方向和宽度。" : "已添加径向蒙版；在画布上拖动以设置位置和大小。");
@@ -1036,6 +1044,7 @@ function prepareMaskPanel() {
       mask.adjustments[key] = value;
       for (const input of selectAll('[data-mask-control="' + key + '"]')) input.value = value;
       dirty = true;
+      syncWorkspaceTitle();
       schedulePreview();
     };
     range.addEventListener("input", change);
@@ -1053,6 +1062,7 @@ function prepareMaskPanel() {
     }
     mask.name = name.slice(0, 60);
     dirty = true;
+    syncWorkspaceTitle();
     renderMaskList();
   });
   byId("mask-feather").addEventListener("input", (event) => {
@@ -1061,6 +1071,7 @@ function prepareMaskPanel() {
     mask.feather = event.currentTarget.valueAsNumber;
     byId("mask-feather-value").textContent = Math.round(mask.feather * 100) + "%";
     dirty = true;
+    syncWorkspaceTitle();
     updateMaskOverlay();
     schedulePreview();
   });
@@ -1069,6 +1080,7 @@ function prepareMaskPanel() {
     if (!mask) return;
     mask.invert = !mask.invert;
     dirty = true;
+    syncWorkspaceTitle();
     syncMaskPanel();
     schedulePreview();
   });
@@ -2661,6 +2673,7 @@ function wireEvents() {
     maskGesture = null;
     if (wasDrawing) maskDrawType = null;
     dirty = true;
+    syncWorkspaceTitle();
     syncMaskPanel();
     schedulePreview();
     setStatus("已更新蒙版");
@@ -2671,6 +2684,7 @@ function wireEvents() {
     maskGesture = null;
     if (wasDrawing) maskDrawType = null;
     dirty = true;
+    syncWorkspaceTitle();
     syncMaskPanel();
     schedulePreview();
   });
@@ -2692,6 +2706,7 @@ function wireEvents() {
     const sourcePoint = outputPointToSource({ x: screenPoint.x + delta[0], y: screenPoint.y + delta[1] });
     moveMaskHandle(mask, key, { x: Math.max(0, Math.min(1, sourcePoint.x)), y: Math.max(0, Math.min(1, sourcePoint.y)) });
     dirty = true;
+    syncWorkspaceTitle();
     updateMaskOverlay();
     schedulePreview();
   });
