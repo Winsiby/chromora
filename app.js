@@ -7,6 +7,7 @@ const imageExtensions = /\.(jpeg|jpg|png|tif|tiff|3fr|arw|cr2|cr3|dng|erf|iiq|kd
 const tabs = {
   landscape: ["调色", "先调整原片，再应用风格，最后微调成片。"],
   portrait: ["人像调整", "把肤色与纹理调整限制在指定区域。"],
+  masks: ["局部调整", "添加渐变或径向蒙版，只影响选定区域。"],
   styles: ["风格与配方", "选好风格后，可以继续微调成片。"],
   project: ["项目", "保存工作状态，或在 Patchy 中继续精修。"]
 };
@@ -68,6 +69,7 @@ const curveColors = { rgb: "#e8c397", red: "#ee8a89", green: "#a0c692", blue: "#
 let curveChannel = "rgb";
 let curvePoint = 0;
 const defaults = Object.fromEntries(Object.entries(controls).map(([key, [, , , , value]]) => [key, value]));
+defaults.masks = [];
 const inputPairs = new Map();
 const originals = new Map();
 const preferences = { luts: [], favorites: [], presets: {} };
@@ -88,6 +90,9 @@ let favoritesOnly = false;
 let editingRegion = false;
 let regionDraft = null;
 let pointerStart = null;
+let selectedMaskId = null;
+let maskDrawType = null;
+let maskGesture = null;
 let photoSequence = 0;
 let renderSequence = 0;
 let renderTimer;
@@ -229,6 +234,7 @@ function syncControls() {
   byId("landscape-lut-name").textContent = preferences.luts.find((lut) => lut.id === photo?.lutId)?.name || "未应用滤镜";
   byId("export-open").disabled = !photo;
   if (byId("curve-section").open) drawCurve();
+  syncMaskPanel();
   updateViewControls();
 }
 
@@ -449,6 +455,392 @@ function prepareCurve(parent) {
   drawCurve();
 }
 
+function currentMasks(photo = currentPhoto()) {
+  if (!photo) return [];
+  if (!Array.isArray(photo.settings.masks)) photo.settings.masks = [];
+  return photo.settings.masks;
+}
+
+function selectedMask() {
+  return currentMasks().find((mask) => mask.id === selectedMaskId) || null;
+}
+
+function createMask(type) {
+  const masks = currentMasks();
+  const number = masks.filter((mask) => mask.type === type).length + 1;
+  const id = crypto.randomUUID ? crypto.randomUUID() : "mask-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+  return {
+    id,
+    name: (type === "linear" ? "线性渐变 " : "径向蒙版 ") + number,
+    type,
+    enabled: true,
+    geometry: type === "linear"
+      ? { start: { x: 0.5, y: 0.12 }, end: { x: 0.5, y: 0.88 } }
+      : { center: { x: 0.5, y: 0.5 }, radius: { x: 0.24, y: 0.24 } },
+    feather: 0.35,
+    invert: false,
+    adjustments: { exposure: 0, highlights: 0, shadows: 0, temperature: 0, saturation: 0 }
+  };
+}
+
+function renderMaskList() {
+  const list = byId("mask-list");
+  if (!list) return;
+  const photo = currentPhoto();
+  const masks = currentMasks(photo);
+  if (selectedMaskId && !masks.some((mask) => mask.id === selectedMaskId)) selectedMaskId = masks[0]?.id || null;
+  list.replaceChildren(...masks.map((mask) => {
+    const row = document.createElement("div");
+    row.className = "mask-row";
+    row.classList.toggle("is-selected", mask.id === selectedMaskId);
+    const choose = document.createElement("button");
+    choose.type = "button";
+    choose.className = "mask-select";
+    choose.setAttribute("aria-pressed", String(mask.id === selectedMaskId));
+    choose.title = "编辑 " + mask.name;
+    const name = document.createElement("span");
+    name.className = "mask-row-name";
+    name.textContent = mask.name;
+    const kind = document.createElement("span");
+    kind.className = "mask-row-type";
+    kind.textContent = mask.type === "linear" ? "线性" : "径向";
+    choose.append(name, kind);
+    choose.addEventListener("click", () => {
+      selectedMaskId = mask.id;
+      renderMaskList();
+      syncMaskPanel();
+      updateMaskOverlay();
+    });
+
+    const enabled = document.createElement("button");
+    enabled.type = "button";
+    enabled.className = "mask-enable";
+    enabled.setAttribute("aria-pressed", String(mask.enabled));
+    enabled.setAttribute("aria-label", (mask.enabled ? "停用 " : "启用 ") + mask.name);
+    enabled.title = mask.enabled ? "停用蒙版" : "启用蒙版";
+    enabled.textContent = mask.enabled ? "开" : "关";
+    enabled.addEventListener("click", () => {
+      mask.enabled = !mask.enabled;
+      dirty = true;
+      renderMaskList();
+      syncMaskPanel();
+      updateMaskOverlay();
+      schedulePreview();
+    });
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "mask-delete icon-button";
+    remove.setAttribute("aria-label", "删除 " + mask.name);
+    remove.title = "删除蒙版";
+    remove.textContent = "×";
+    remove.addEventListener("click", () => {
+      const index = masks.findIndex((entry) => entry.id === mask.id);
+      if (index >= 0) masks.splice(index, 1);
+      if (selectedMaskId === mask.id) selectedMaskId = masks[Math.min(index, masks.length - 1)]?.id || null;
+      dirty = true;
+      renderMaskList();
+      syncMaskPanel();
+      updateMaskOverlay();
+      schedulePreview();
+      setStatus("已删除蒙版");
+    });
+    row.append(choose, enabled, remove);
+    return row;
+  }));
+  byId("mask-count").textContent = masks.length + " 个";
+  byId("mask-empty").hidden = masks.length > 0;
+}
+
+function syncMaskPanel() {
+  const photo = currentPhoto();
+  const mask = selectedMask();
+  byId("mask-add-linear").disabled = !photo;
+  byId("mask-add-radial").disabled = !photo;
+  byId("mask-empty").hidden = !photo || currentMasks(photo).length > 0;
+  byId("mask-no-photo").hidden = Boolean(photo);
+  byId("mask-editor").hidden = !mask;
+  if (mask) {
+    byId("mask-name").value = mask.name;
+    byId("mask-type-note").textContent = mask.type === "linear"
+      ? "起点为完整效果，终点为零效果；两点距离决定过渡宽度。"
+      : "拖动中心和边缘控制点调整椭圆；羽化只作用于径向边缘。";
+    byId("mask-feather-group").hidden = mask.type !== "radial";
+    byId("mask-feather").value = mask.feather;
+    byId("mask-feather-value").textContent = Math.round(mask.feather * 100) + "%";
+    byId("mask-invert").setAttribute("aria-pressed", String(mask.invert));
+    byId("mask-invert").textContent = mask.invert ? "已反选" : "反选蒙版";
+    for (const input of selectAll("[data-mask-control]")) {
+      const key = input.dataset.maskControl;
+      input.value = mask.adjustments[key] ?? 0;
+    }
+  }
+  byId("mask-instruction").textContent = maskDrawType
+    ? (maskDrawType === "linear" ? "在画布上拖动，设置渐变方向和过渡宽度。" : "在画布上从中心向外拖动，设置椭圆位置和大小。")
+    : "选择蒙版后可拖动画布控制点；添加蒙版后也可直接在画布上绘制。";
+  updateMaskOverlay();
+}
+
+function prepareMaskPanel() {
+  const panel = byId("panel-masks");
+  panel.innerHTML = `
+    <div class="mask-create-actions">
+      <button type="button" class="button outline" id="mask-add-linear">线性渐变</button>
+      <button type="button" class="button outline" id="mask-add-radial">径向蒙版</button>
+    </div>
+    <p class="section-note mask-instruction" id="mask-instruction"></p>
+    <div class="mask-list-heading"><h3>蒙版</h3><span id="mask-count">0 个</span></div>
+    <div class="mask-list" id="mask-list" aria-label="蒙版列表"></div>
+    <p class="section-note mask-empty" id="mask-empty">还没有蒙版。添加渐变压暗天空，或用径向蒙版局部提亮。</p>
+    <p class="section-note mask-empty" id="mask-no-photo" hidden>打开照片后即可添加局部蒙版。</p>
+    <section class="mask-editor" id="mask-editor" hidden aria-label="蒙版设置">
+      <label class="field">名称<input id="mask-name" maxlength="60" autocomplete="off"></label>
+      <p class="section-note" id="mask-type-note"></p>
+      <div class="mask-option-row">
+        <button type="button" class="button small outline" id="mask-invert" aria-pressed="false">反选蒙版</button>
+      </div>
+      <div class="control-group mask-feather-group" id="mask-feather-group">
+        <div class="mask-feather-heading"><label for="mask-feather">羽化</label><output id="mask-feather-value">35%</output></div>
+        <input id="mask-feather" type="range" min="0" max="1" step="0.01" value="0.35">
+      </div>
+      <div class="control-group mask-adjustments">
+        <h3>局部调整</h3>
+        <div id="mask-adjustments"></div>
+      </div>
+    </section>`;
+
+  for (const [id, type] of [["mask-add-linear", "linear"], ["mask-add-radial", "radial"]]) {
+    byId(id).addEventListener("click", () => {
+      const mask = createMask(type);
+      currentMasks().push(mask);
+      selectedMaskId = mask.id;
+      maskDrawType = type;
+      dirty = true;
+      renderMaskList();
+      syncMaskPanel();
+      setStatus(type === "linear" ? "已添加线性渐变；在画布上拖动以设置方向和宽度。" : "已添加径向蒙版；在画布上拖动以设置位置和大小。");
+    });
+  }
+
+  const specs = [
+    ["exposure", "曝光", -3, 3, 0.05],
+    ["highlights", "高光", -100, 100, 1],
+    ["shadows", "阴影", -100, 100, 1],
+    ["temperature", "色温偏移", -100, 100, 1],
+    ["saturation", "饱和度", -100, 100, 1]
+  ];
+  const container = byId("mask-adjustments");
+  for (const [key, label, min, max, step] of specs) {
+    const row = document.createElement("div");
+    row.className = "control-row mask-adjustment-row";
+    const title = document.createElement("label");
+    title.htmlFor = "mask-control-" + key;
+    title.textContent = label;
+    const range = document.createElement("input");
+    range.type = "range";
+    range.id = title.htmlFor;
+    range.min = min;
+    range.max = max;
+    range.step = step;
+    range.dataset.maskControl = key;
+    range.setAttribute("aria-label", label);
+    const number = document.createElement("input");
+    number.type = "number";
+    number.min = min;
+    number.max = max;
+    number.step = step;
+    number.dataset.maskControl = key;
+    number.setAttribute("aria-label", label + "数值");
+    const change = (event) => {
+      const mask = selectedMask();
+      if (!mask) return;
+      const raw = Number(event.currentTarget.value);
+      if (!Number.isFinite(raw)) return;
+      const value = Math.max(min, Math.min(max, Number((Math.round(raw / step) * step).toFixed(2))));
+      mask.adjustments[key] = value;
+      for (const input of selectAll('[data-mask-control="' + key + '"]')) input.value = value;
+      dirty = true;
+      schedulePreview();
+    };
+    range.addEventListener("input", change);
+    number.addEventListener("change", change);
+    row.append(title, range, number);
+    container.append(row);
+  }
+  byId("mask-name").addEventListener("change", (event) => {
+    const mask = selectedMask();
+    if (!mask) return;
+    const name = event.currentTarget.value.trim();
+    if (!name) {
+      event.currentTarget.value = mask.name;
+      return;
+    }
+    mask.name = name.slice(0, 60);
+    dirty = true;
+    renderMaskList();
+  });
+  byId("mask-feather").addEventListener("input", (event) => {
+    const mask = selectedMask();
+    if (!mask || mask.type !== "radial") return;
+    mask.feather = event.currentTarget.valueAsNumber;
+    byId("mask-feather-value").textContent = Math.round(mask.feather * 100) + "%";
+    dirty = true;
+    updateMaskOverlay();
+    schedulePreview();
+  });
+  byId("mask-invert").addEventListener("click", () => {
+    const mask = selectedMask();
+    if (!mask) return;
+    mask.invert = !mask.invert;
+    dirty = true;
+    syncMaskPanel();
+    schedulePreview();
+  });
+  renderMaskList();
+  syncMaskPanel();
+}
+
+function svgElement(tag, attributes = {}) {
+  const element = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, String(value));
+  return element;
+}
+
+function maskHandle(group, mask, name, x, y, label) {
+  const circle = svgElement("circle", {
+    cx: x * 1000, cy: y * 1000, r: 11,
+    class: "mask-handle", "data-mask-handle": name, "data-mask-id": mask.id,
+    tabindex: 0, role: "slider", "aria-label": mask.name + "：" + label,
+    "aria-valuemin": 0, "aria-valuemax": 1, "aria-valuenow": Math.round((name.startsWith("radius") ? mask.geometry.radius[name === "radius-x" ? "x" : "y"] : (name === "center" ? mask.geometry.center[name === "center" ? "x" : "y"] : mask.geometry[name].x)) * 100) / 100
+  });
+  const title = svgElement("title");
+  title.textContent = label;
+  circle.append(title);
+  group.append(circle);
+}
+
+function updateMaskOverlay() {
+  const overlay = byId("mask-overlay");
+  if (!overlay) return;
+  const photo = currentPhoto();
+  overlay.hidden = tab !== "masks" || !photo || byId("view").hidden;
+  overlay.classList.toggle("is-drawing", Boolean(maskDrawType));
+  overlay.replaceChildren();
+  if (overlay.hidden) return;
+  const defs = svgElement("defs");
+  overlay.append(defs);
+  const stackRect = byId("photo-stack").getBoundingClientRect();
+  const shortEdge = Math.min(stackRect.width, stackRect.height) || 1;
+  for (const [index, mask] of currentMasks(photo).entries()) {
+    const selected = mask.id === selectedMaskId;
+    const color = mask.enabled ? "#dfb588" : "#87919c";
+    const group = svgElement("g", { class: "mask-shape" + (selected ? " is-selected" : ""), "data-mask-select": mask.id, opacity: mask.enabled ? 1 : 0.55 });
+    if (mask.type === "linear") {
+      const gradientId = "mask-gradient-" + index;
+      const gradient = svgElement("linearGradient", {
+        id: gradientId, gradientUnits: "userSpaceOnUse",
+        x1: mask.geometry.start.x * 1000, y1: mask.geometry.start.y * 1000,
+        x2: mask.geometry.end.x * 1000, y2: mask.geometry.end.y * 1000
+      });
+      gradient.append(
+        svgElement("stop", { offset: "0%", "stop-color": color, "stop-opacity": mask.enabled ? (mask.invert ? "0.01" : "0.22") : "0.08" }),
+        svgElement("stop", { offset: "78%", "stop-color": color, "stop-opacity": "0.08" }),
+        svgElement("stop", { offset: "100%", "stop-color": color, "stop-opacity": mask.invert ? "0.22" : "0.01" })
+      );
+      defs.append(gradient);
+      group.append(svgElement("rect", { x: 0, y: 0, width: 1000, height: 1000, fill: "url(#" + gradientId + ")", "pointer-events": "none" }));
+      group.append(svgElement("line", {
+        x1: mask.geometry.start.x * 1000, y1: mask.geometry.start.y * 1000,
+        x2: mask.geometry.end.x * 1000, y2: mask.geometry.end.y * 1000,
+        class: "mask-axis", stroke: color, "stroke-width": selected ? 2.5 : 1.5,
+        "stroke-dasharray": selected ? "none" : "6 8", "vector-effect": "non-scaling-stroke"
+      }));
+      if (selected) {
+        maskHandle(group, mask, "start", mask.geometry.start.x, mask.geometry.start.y, "渐变起点");
+        maskHandle(group, mask, "end", mask.geometry.end.x, mask.geometry.end.y, "渐变终点");
+      }
+    } else {
+      const center = mask.geometry.center;
+      const radius = mask.geometry.radius;
+      const featherX = mask.feather * shortEdge / (stackRect.width || shortEdge);
+      const featherY = mask.feather * shortEdge / (stackRect.height || shortEdge);
+      const coverageId = "mask-coverage-" + index;
+      const coverage = svgElement("mask", { id: coverageId, maskUnits: "userSpaceOnUse", x: 0, y: 0, width: 1000, height: 1000 });
+      coverage.append(svgElement("rect", { x: 0, y: 0, width: 1000, height: 1000, fill: mask.invert ? "white" : "black" }));
+      coverage.append(svgElement("ellipse", {
+        cx: center.x * 1000, cy: center.y * 1000,
+        rx: radius.x * 1000, ry: radius.y * 1000,
+        fill: mask.invert ? "black" : "white"
+      }));
+      defs.append(coverage);
+      group.append(svgElement("rect", {
+        x: 0, y: 0, width: 1000, height: 1000, fill: color,
+        "fill-opacity": mask.enabled ? "0.12" : "0.045", mask: "url(#" + coverageId + ")", "pointer-events": "none"
+      }));
+      group.append(svgElement("ellipse", {
+        cx: center.x * 1000, cy: center.y * 1000,
+        rx: radius.x * 1000, ry: radius.y * 1000,
+        fill: "none",
+        stroke: color, "stroke-width": selected ? 2 : 1.4,
+        "stroke-dasharray": selected ? "none" : "6 8", "vector-effect": "non-scaling-stroke"
+      }));
+      if (selected && mask.feather > 0) {
+        group.append(svgElement("ellipse", {
+          cx: center.x * 1000, cy: center.y * 1000,
+          rx: Math.min(1, radius.x + featherX) * 1000,
+          ry: Math.min(1, radius.y + featherY) * 1000,
+          fill: "none", stroke: color, "stroke-width": 1.2, "stroke-dasharray": "3 6",
+          "vector-effect": "non-scaling-stroke", "pointer-events": "none", opacity: 0.72
+        }));
+      }
+      if (selected) {
+        maskHandle(group, mask, "center", center.x, center.y, "蒙版中心");
+        maskHandle(group, mask, "radius-x", Math.min(1, center.x + radius.x), center.y, "椭圆横向大小");
+        maskHandle(group, mask, "radius-y", center.x, Math.min(1, center.y + radius.y), "椭圆纵向大小");
+      }
+    }
+    overlay.append(group);
+  }
+}
+
+function maskPoint(event) {
+  const bounds = byId("mask-overlay").getBoundingClientRect();
+  const limit = (value) => Math.max(0, Math.min(1, value));
+  return { x: limit((event.clientX - bounds.left) / bounds.width), y: limit((event.clientY - bounds.top) / bounds.height) };
+}
+
+function moveMaskHandle(mask, handle, point) {
+  if (mask.type === "linear") {
+    if (handle === "start" || handle === "end") mask.geometry[handle] = { ...point };
+  } else if (handle === "center") {
+    const radius = mask.geometry.radius;
+    mask.geometry.center = {
+      x: Math.max(radius.x, Math.min(1 - radius.x, point.x)),
+      y: Math.max(radius.y, Math.min(1 - radius.y, point.y))
+    };
+  } else if (handle === "radius-x") {
+    mask.geometry.radius.x = Math.max(0.01, Math.min(1, Math.abs(point.x - mask.geometry.center.x)));
+  } else if (handle === "radius-y") {
+    mask.geometry.radius.y = Math.max(0.01, Math.min(1, Math.abs(point.y - mask.geometry.center.y)));
+  }
+}
+
+function updateMaskGesture(event) {
+  if (!maskGesture) return;
+  const mask = currentMasks().find((entry) => entry.id === maskGesture.id);
+  if (!mask) return;
+  const point = maskPoint(event);
+  if (maskGesture.drawType === "linear") mask.geometry.end = point;
+  else if (maskGesture.drawType === "radial") {
+    mask.geometry.center = { ...maskGesture.start };
+    mask.geometry.radius = {
+      x: Math.max(0.01, Math.abs(point.x - maskGesture.start.x)),
+      y: Math.max(0.01, Math.abs(point.y - maskGesture.start.y))
+    };
+  } else moveMaskHandle(mask, maskGesture.handle, point);
+  updateMaskOverlay();
+}
+
 function preparePanels() {
   const landscape = byId("panel-landscape");
   const histogram = document.createElement("div");
@@ -487,6 +879,7 @@ function preparePanels() {
     syncControls();
     schedulePreview();
   });
+  prepareMaskPanel();
   controlGroup(byId("style-sliders"), "应用强度", ["lutStrength"]);
   controlGroup(byId("style-sliders"), "成片微调", postKeys, "-styles");
 }
@@ -494,6 +887,10 @@ function preparePanels() {
 function selectTab(next) {
   if (!tabs[next]) return;
   if (editingRegion) finishRegion(false);
+  if (next !== "masks") {
+    maskDrawType = null;
+    maskGesture = null;
+  }
   tab = next;
   const [title, caption] = tabs[next];
   byId("inspector-title").textContent = title;
@@ -505,6 +902,7 @@ function selectTab(next) {
     button.setAttribute("aria-pressed", String(button.dataset.tab === next));
   }
   updateRegionOverlay();
+  syncMaskPanel();
   if (next === "project" && capability) loadProjectList();
   if (next === "landscape") drawHistogram();
 }
@@ -570,7 +968,7 @@ async function importPhotos(files) {
         if (typeof info.id !== "string") throw new Error("未取得照片编号");
         const existing = photos.find((photo) => photo.id === info.id);
         if (!existing) {
-          photos.push({ id: info.id, name: info.name || file.name, raw: Boolean(info.raw), settings: { ...defaults }, lutId: null });
+          photos.push({ id: info.id, name: info.name || file.name, raw: Boolean(info.raw), settings: { ...defaults, masks: [] }, lutId: null });
         }
         imported.push(info.id);
       } catch (error) {
@@ -613,6 +1011,7 @@ function updateViewControls() {
   byId("zoom-label").textContent = actualZoom && fullOriginal
     ? "实际像素"
     : (zoom === 1 ? "适合窗口" : "适合 ×" + Math.round(zoom * 100) / 100);
+  updateMaskOverlay();
 }
 
 function fitImage() {
@@ -642,7 +1041,8 @@ function renderBlob(photo, settings, lutId, signal, resolution = "preview") {
 }
 
 function hasAdjustments(photo) {
-  return Boolean(photo.lutId) || Boolean(Object.keys(photo.settings.curves || {}).length) || Object.entries(defaults).some(([key, value]) => key !== "lutStrength" && (photo.settings[key] ?? value) !== value);
+  const hasMaskAdjustments = (photo.settings.masks || []).some((mask) => mask.enabled && Object.values(mask.adjustments || {}).some((value) => Number(value) !== 0));
+  return hasMaskAdjustments || Boolean(photo.lutId) || Boolean(Object.keys(photo.settings.curves || {}).length) || Object.entries(defaults).some(([key, value]) => key !== "lutStrength" && key !== "masks" && (photo.settings[key] ?? value) !== value);
 }
 
 function renderStatus(label) {
@@ -676,6 +1076,9 @@ async function selectPhoto(id, force = false) {
   previewController?.abort();
   if (editingRegion) finishRegion(false);
   currentId = id;
+  selectedMaskId = currentMasks().find((mask) => mask.id === selectedMaskId)?.id || currentMasks()[0]?.id || null;
+  maskDrawType = null;
+  maskGesture = null;
   zoom = 1;
   actualZoom = false;
   peekingOriginal = false;
@@ -695,6 +1098,7 @@ async function selectPhoto(id, force = false) {
   byId("footer-meta").textContent = photo?.raw ? "RAW 照片 / 本机处理" : "仅在本机处理";
   updateFilmSelection();
   drawLuts();
+  renderMaskList();
   updateRegionOverlay();
   syncControls();
   if (!photo) {
@@ -1134,7 +1538,10 @@ async function restoreProject(event) {
     const response = await request("/api/project?name=" + encodeURIComponent(name));
     const project = await response.json();
     if (!Array.isArray(project.state?.photos)) throw new Error("项目中的照片列表无效。");
-    photos = project.state.photos.map((photo) => ({ ...photo, settings: { ...defaults, ...photo.settings } }));
+    photos = project.state.photos.map((photo) => ({
+      ...photo,
+      settings: { ...defaults, ...photo.settings, masks: Array.isArray(photo.settings?.masks) ? photo.settings.masks : [] }
+    }));
     for (const lut of project.state.luts || []) {
       if (!preferences.luts.some((entry) => entry.id === lut.id)) preferences.luts.push(lut);
     }
@@ -1262,11 +1669,14 @@ function wireEvents() {
   on("reset-photo", "click", () => {
     const photo = currentPhoto();
     if (!photo) return;
-    photo.settings = { ...defaults };
+    photo.settings = { ...defaults, masks: [] };
     photo.lutId = null;
+    selectedMaskId = null;
+    maskDrawType = null;
     dirty = true;
     if (editingRegion) finishRegion(false);
     updateRegionOverlay();
+    renderMaskList();
     drawLuts();
     syncControls();
     schedulePreview();
@@ -1292,6 +1702,74 @@ function wireEvents() {
   on("photo-stack", "pointercancel", () => { pointerStart = null; });
   on("photo-stack", "keydown", regionKey);
   on("region-apply", "click", () => finishRegion(true));
+
+  const maskCanvas = byId("mask-overlay");
+  maskCanvas.addEventListener("pointerdown", (event) => {
+    if (tab !== "masks" || !currentPhoto() || event.button !== 0) return;
+    const handle = event.target.closest?.("[data-mask-handle]");
+    if (handle) {
+      selectedMaskId = handle.dataset.maskId;
+      renderMaskList();
+      syncMaskPanel();
+      maskGesture = { id: selectedMaskId, handle: handle.dataset.maskHandle, pointerId: event.pointerId };
+      event.preventDefault();
+      maskCanvas.setPointerCapture(event.pointerId);
+      return;
+    }
+    if (!maskDrawType || !event.target.closest?.(".mask-overlay")) return;
+    const mask = selectedMask();
+    if (!mask) return;
+    const point = maskPoint(event);
+    if (maskDrawType === "linear") mask.geometry = { start: { ...point }, end: { ...point } };
+    else mask.geometry = { center: { ...point }, radius: { x: 0.01, y: 0.01 } };
+    maskGesture = { id: mask.id, drawType: maskDrawType, start: point, pointerId: event.pointerId };
+    event.preventDefault();
+    maskCanvas.setPointerCapture(event.pointerId);
+    updateMaskOverlay();
+  });
+  maskCanvas.addEventListener("pointermove", (event) => {
+    if (!maskGesture || maskGesture.pointerId !== event.pointerId) return;
+    updateMaskGesture(event);
+  });
+  maskCanvas.addEventListener("pointerup", (event) => {
+    if (!maskGesture || maskGesture.pointerId !== event.pointerId) return;
+    updateMaskGesture(event);
+    const wasDrawing = Boolean(maskGesture.drawType);
+    maskGesture = null;
+    if (wasDrawing) maskDrawType = null;
+    dirty = true;
+    syncMaskPanel();
+    schedulePreview();
+    setStatus("已更新蒙版");
+  });
+  maskCanvas.addEventListener("pointercancel", (event) => {
+    if (!maskGesture || maskGesture.pointerId !== event.pointerId) return;
+    const wasDrawing = Boolean(maskGesture.drawType);
+    maskGesture = null;
+    if (wasDrawing) maskDrawType = null;
+    dirty = true;
+    syncMaskPanel();
+    schedulePreview();
+  });
+  maskCanvas.addEventListener("keydown", (event) => {
+    const handle = event.target.closest?.("[data-mask-handle]");
+    if (!handle) return;
+    const mask = currentMasks().find((entry) => entry.id === handle.dataset.maskId);
+    const delta = { ArrowLeft: [-0.01, 0], ArrowRight: [0.01, 0], ArrowUp: [0, -0.01], ArrowDown: [0, 0.01] }[event.key];
+    if (!mask || !delta) return;
+    const key = handle.dataset.maskHandle;
+    if ((key === "radius-x" && delta[1]) || (key === "radius-y" && delta[0])) return;
+    event.preventDefault();
+    let point;
+    if (mask.type === "linear") point = { x: mask.geometry[key].x + delta[0], y: mask.geometry[key].y + delta[1] };
+    else if (key === "center") point = { x: mask.geometry.center.x + delta[0], y: mask.geometry.center.y + delta[1] };
+    else if (key === "radius-x") point = { x: mask.geometry.center.x + mask.geometry.radius.x + delta[0], y: mask.geometry.center.y };
+    else point = { x: mask.geometry.center.x, y: mask.geometry.center.y + mask.geometry.radius.y + delta[1] };
+    moveMaskHandle(mask, key, { x: Math.max(0, Math.min(1, point.x)), y: Math.max(0, Math.min(1, point.y)) });
+    dirty = true;
+    updateMaskOverlay();
+    schedulePreview();
+  });
 
   const drop = byId("drop-hint");
   window.addEventListener("dragover", (event) => {

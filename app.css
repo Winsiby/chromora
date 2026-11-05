@@ -203,3 +203,42 @@ dialog::backdrop { background: #06090ca6; }
 .curve-fields .field { margin-bottom: 7px; }
 .curve-fields input, .curve-fields select { min-height: 27px; padding: 3px 5px; font-size: 11px; }
 .curve-actions { display: flex; gap: 5px; }
+
+.mask-create-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; padding: 8px 0 2px; }
+.mask-create-actions .button { min-height: 36px; }
+.mask-instruction { padding: 7px 9px; border-left: 2px solid #80674e; background: #191e24; }
+.mask-list-heading { display: flex; align-items: center; justify-content: space-between; margin: 11px 0 6px; }
+.mask-list-heading h3 { font-size: 12px; font-weight: 650; }
+.mask-list-heading span { color: var(--subtle); font-size: 11px; }
+.mask-list { display: grid; gap: 5px; }
+.mask-row { display: flex; align-items: center; gap: 3px; min-width: 0; padding: 3px; border: 1px solid #39434e; border-radius: 5px; background: var(--well); }
+.mask-row.is-selected { border-color: #8b7153; background: #292620; }
+.mask-select { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex: 1; min-width: 0; min-height: 31px; padding: 4px 6px; border: 0; background: transparent; text-align: left; }
+.mask-row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.mask-row-type { flex: none; color: var(--subtle); font-size: 10px; }
+.mask-enable { flex: none; min-width: 32px; height: 26px; padding: 2px 5px; border: 1px solid #46515e; border-radius: 4px; color: var(--muted); background: #20262e; font-size: 10px; }
+.mask-enable[aria-pressed=true] { border-color: #6a5846; color: var(--accent); }
+.mask-delete { font-size: 19px; }
+.mask-empty { margin: 8px 0 13px; }
+.mask-editor { margin-top: 12px; border-top: 1px solid var(--edge); padding-top: 10px; }
+.mask-editor .field { margin-bottom: 7px; }
+.mask-option-row { display: flex; margin: 5px 0 2px; }
+.mask-editor .control-group { padding-top: 9px; }
+.mask-feather-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; color: var(--muted); font-size: 12px; }
+.mask-feather-heading output { color: var(--text); font-variant-numeric: tabular-nums; font-size: 11px; }
+#mask-feather { width: 100%; margin: 0; accent-color: var(--accent); }
+.mask-adjustments > h3 { margin-bottom: 5px; }
+.mask-adjustment-row { grid-template-columns: 65px minmax(0, 1fr) 46px; }
+.mask-overlay { position: absolute; z-index: 4; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; touch-action: none; }
+.mask-overlay.is-drawing { pointer-events: all; cursor: crosshair; }
+.mask-overlay .mask-handle { pointer-events: all; fill: #20262e; stroke: var(--accent); stroke-width: 2.5; vector-effect: non-scaling-stroke; cursor: grab; }
+.mask-overlay .mask-handle:active { cursor: grabbing; fill: #493d30; }
+.mask-overlay .mask-handle:focus-visible { outline: none; stroke: #fff0d9; stroke-width: 4; }
+.mask-overlay .mask-axis { pointer-events: none; }
+
+@media (max-width: 735px) {
+  .mask-create-actions { padding-top: 4px; }
+  .mask-row { gap: 2px; }
+  .mask-select { gap: 5px; padding-inline: 4px; }
+  .mask-adjustment-row { grid-template-columns: 58px minmax(0, 1fr) 40px; gap: 6px; }
+}
