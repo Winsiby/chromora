@@ -180,17 +180,46 @@ function namedAspectRatio(value, composition = photoComposition()) {
   return width > 0 && height > 0 ? width / height : null;
 }
 
-function centeredCropForAspect(value, composition = photoComposition()) {
-  if (value === "original") return { x: 0, y: 0, width: 1, height: 1 };
+function cropForAspectAtCenter(value, center, composition = photoComposition()) {
   const target = namedAspectRatio(value, composition);
   const dimensions = rotatedDimensions(composition);
   const imageAspect = dimensions.width && dimensions.height ? dimensions.width / dimensions.height : 1;
   if (!target) return null;
-  let width = 1;
-  let height = 1;
-  if (imageAspect > target) width = target / imageAspect;
-  else height = imageAspect / target;
-  return { x: (1 - width) / 2, y: (1 - height) / 2, width, height };
+  const normalizedAspect = target / imageAspect;
+  const width = Math.min(1, normalizedAspect);
+  const height = width / normalizedAspect;
+  const centerX = Math.max(width / 2, Math.min(1 - width / 2, center.x));
+  const centerY = Math.max(height / 2, Math.min(1 - height / 2, center.y));
+  return { x: centerX - width / 2, y: centerY - height / 2, width, height };
+}
+
+function centeredCropForAspect(value, composition = photoComposition()) {
+  return cropForAspectAtCenter(value, { x: 0.5, y: 0.5 }, composition);
+}
+
+function rotateCropPoint(point, direction) {
+  const turn = (direction % 360 + 360) % 360;
+  if (turn === 90) return { x: 1 - point.y, y: point.x };
+  if (turn === 180) return { x: 1 - point.x, y: 1 - point.y };
+  if (turn === 270) return { x: point.y, y: 1 - point.x };
+  return { ...point };
+}
+
+function rotateCropRectangle(crop, direction) {
+  const turn = (direction % 360 + 360) % 360;
+  if (turn === 90) return {
+    x: 1 - crop.y - crop.height, y: crop.x,
+    width: crop.height, height: crop.width
+  };
+  if (turn === 180) return {
+    x: 1 - crop.x - crop.width, y: 1 - crop.y - crop.height,
+    width: crop.width, height: crop.height
+  };
+  if (turn === 270) return {
+    x: crop.y, y: 1 - crop.x - crop.width,
+    width: crop.height, height: crop.width
+  };
+  return { ...crop };
 }
 
 function cropRect(composition = photoComposition()) {
@@ -1999,7 +2028,17 @@ function chooseAspect(value) {
 
 function rotateComposition(direction) {
   changeComposition((composition) => {
+    const previousCrop = composition.crop ? { ...composition.crop } : null;
+    const previousCenter = previousCrop
+      ? { x: previousCrop.x + previousCrop.width / 2, y: previousCrop.y + previousCrop.height / 2 }
+      : { x: 0.5, y: 0.5 };
+    const nextCenter = rotateCropPoint(previousCenter, direction);
     composition.rotation = (composition.rotation + direction + 360) % 360;
+    if (composition.aspect === "free") {
+      if (previousCrop) composition.crop = rotateCropRectangle(previousCrop, direction);
+    } else {
+      composition.crop = cropForAspectAtCenter(composition.aspect, nextCenter, composition);
+    }
   });
   setStatus("已旋转照片 " + (direction > 0 ? "90°" : "-90°"));
 }

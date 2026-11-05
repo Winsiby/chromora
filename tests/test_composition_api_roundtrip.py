@@ -355,6 +355,52 @@ class CompositionApiRoundTripTests(unittest.TestCase):
             "工程重开后的构图渲染必须与保存前一致",
         )
 
+    def test_rotated_fixed_ratio_survives_project_round_trip_and_exact_exports(self):
+        odd_pixels = np.full((201, 321, 3), (92, 112, 132), dtype=np.uint8)
+        odd_photo_id = self.install_photo(encode_png(odd_pixels), ".png")
+        rotated_width, rotated_height = 201, 321
+        crop_height = (rotated_width / rotated_height) / (4 / 5)
+        composition = {
+            "crop": {
+                "x": 0,
+                "y": (1 - crop_height) / 2,
+                "width": 1,
+                "height": crop_height,
+            },
+            "aspect": "4:5",
+            "rotation": 90,
+            "straighten": 0,
+        }
+        settings = {"composition": composition}
+        project_name = "rotated fixed 4x5"
+        status, body, _ = self.save_project(project_name, self.state(settings, photo_id=odd_photo_id))
+        self.assertEqual(status, 200, body.decode("utf-8", "replace"))
+        status, body, _ = self.load_project(project_name)
+        self.assertEqual(status, 200, body.decode("utf-8", "replace"))
+        reopened = json.loads(body)["state"]["photos"][0]["settings"]
+        self.assertEqual(reopened["composition"]["aspect"], "4:5")
+        self.assertEqual(reopened["composition"]["rotation"], 90)
+        self.assertEqual(reopened["composition"]["crop"], composition["crop"],
+                         "保存并重开必须保留重算后的裁剪区域")
+
+        preview = self.render_rgb(reopened, resolution="preview", photo_id=odd_photo_id)
+        jpeg_path = self.export_file(reopened, "jpeg", photo_id=odd_photo_id)
+        tiff_path = self.export_file(reopened, "tiff", photo_id=odd_photo_id)
+        with Image.open(jpeg_path) as image:
+            jpeg_size = image.size
+        tiff = self.decode_tiff(tiff_path)
+        dimensions = (
+            ("preview", preview.shape[1], preview.shape[0]),
+            ("JPG", jpeg_size[0], jpeg_size[1]),
+            ("TIFF", tiff.shape[1], tiff.shape[0]),
+        )
+        for label, width, height in dimensions:
+            with self.subTest(output=label):
+                self.assertGreater(width, 0)
+                self.assertGreater(height, 0)
+                self.assertEqual(width * 5, height * 4,
+                                 f"{label} 必须保持精确 4:5 像素尺寸")
+
     def test_clear_crop_preserves_rotation_and_straighten_while_reset_clears_all(self):
         cropped = {
             "crop": {"x": 0.18, "y": 0.25, "width": 0.64, "height": 0.5},

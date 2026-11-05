@@ -6,6 +6,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { PhotoHistory } = require("../history.js");
 const source = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
 const boundary = source.indexOf("const histogramSample =");
 assert.ok(boundary > 0, "workbench initialization boundary must remain identifiable");
@@ -23,9 +24,24 @@ vm.runInContext(source.slice(0, boundary) + `
       actualZoom = true;
       fullOriginal = { width, height, compositionKey: JSON.stringify(photoComposition()) };
     },
-    centeredCropForAspect, resizeCropCorner, gradeWheelMarkerPosition, gradeWheelPointerHitsMarker, gradeWheelPointFromClient, gradeWheelValuesAtPoint, sourcePointToOutput,
+    centeredCropForAspect, cropForAspectAtCenter, rotateCropPoint, rotateCropRectangle,
+    resizeCropCorner, gradeWheelMarkerPosition, gradeWheelPointerHitsMarker, gradeWheelPointFromClient, gradeWheelValuesAtPoint, sourcePointToOutput,
     outputPointToSource, sourceToOutputMatrix, cropPointToScreen,
-    screenPointToCrop, rotatedDimensions
+    screenPointToCrop, rotatedDimensions,
+    editComposition(action, value) {
+      const originalChangeComposition = changeComposition;
+      const originalSetStatus = setStatus;
+      changeComposition = (mutator) => mutator(photos[0].settings.composition);
+      setStatus = () => {};
+      try {
+        if (action === "rotate") rotateComposition(value);
+        else chooseAspect(value);
+        return JSON.parse(JSON.stringify(photos[0].settings.composition));
+      } finally {
+        changeComposition = originalChangeComposition;
+        setStatus = originalSetStatus;
+      }
+    }
   };
 `, context);
 const api = context.geometry;
@@ -72,6 +88,47 @@ for (const rotation of [0, 90, 180, 270]) {
   }
   assert.equal(JSON.stringify(api.centeredCropForAspect("original", composition)), JSON.stringify({ x: 0, y: 0, width: 1, height: 1 }));
 }
+
+api.setComposition({ ...defaults });
+const selectedBeforeRotation = api.editComposition("aspect", "4:5");
+const rotatedAfterSelection = api.editComposition("rotate", 90);
+assert.equal(rotatedAfterSelection.aspect, "4:5", "rotating must retain the selected output ratio");
+let rotatedDimensions = api.rotatedDimensions(rotatedAfterSelection);
+let rotatedCrop = rotatedAfterSelection.crop;
+near(rotatedCrop.width * rotatedDimensions.width / (rotatedCrop.height * rotatedDimensions.height), 4 / 5,
+  "select 4:5 then rotate keeps exact output ratio");
+assert.ok(rotatedCrop.x >= 0 && rotatedCrop.y >= 0 && rotatedCrop.x + rotatedCrop.width <= 1 &&
+  rotatedCrop.y + rotatedCrop.height <= 1, "rotated fixed-ratio crop stays inside the image");
+
+const history = new PhotoHistory();
+const snapshot = (composition) => ({ settings: { composition: JSON.parse(JSON.stringify(composition)) }, lutId: null });
+history.reset("ratio-rotation", snapshot(selectedBeforeRotation));
+assert.equal(history.record("ratio-rotation", snapshot(selectedBeforeRotation), snapshot(rotatedAfterSelection)), true);
+assert.deepEqual(history.undo("ratio-rotation", snapshot(rotatedAfterSelection)), snapshot(selectedBeforeRotation),
+  "undo restores the pre-rotation crop and ratio");
+assert.deepEqual(history.redo("ratio-rotation", snapshot(selectedBeforeRotation)), snapshot(rotatedAfterSelection),
+  "redo restores the recomputed rotated crop and ratio");
+
+api.setComposition({ ...defaults, rotation: 90 });
+const selectedAfterRotation = api.editComposition("aspect", "4:5");
+assert.equal(selectedAfterRotation.aspect, "4:5", "selecting a fixed ratio after rotation retains the ratio");
+rotatedDimensions = api.rotatedDimensions(selectedAfterRotation);
+rotatedCrop = selectedAfterRotation.crop;
+near(rotatedCrop.width * rotatedDimensions.width / (rotatedCrop.height * rotatedDimensions.height), 4 / 5,
+  "rotate then select 4:5 keeps exact output ratio");
+
+api.setComposition({
+  ...defaults,
+  aspect: "4:5",
+  crop: { x: 0.31, y: 0.4, width: 0.32, height: 0.6 }
+});
+const offCenterRotated = api.editComposition("rotate", 90);
+const offCenterCrop = offCenterRotated.crop;
+near(offCenterCrop.x + offCenterCrop.width / 2, 0.5, "rotated crop center is clamped horizontally");
+near(offCenterCrop.y + offCenterCrop.height / 2, 0.47, "rotated crop favors the transformed previous center");
+rotatedDimensions = api.rotatedDimensions(offCenterRotated);
+near(offCenterCrop.width * rotatedDimensions.width / (offCenterCrop.height * rotatedDimensions.height), 4 / 5,
+  "off-center crop remains 4:5 after rotation");
 
 const initial = { x: 0.1, y: 0.1, width: 0.8, height: 0.8 };
 for (const [handle, point] of [["nw", { x: 0.2, y: 0.2 }], ["ne", { x: 0.8, y: 0.2 }], ["se", { x: 0.8, y: 0.8 }], ["sw", { x: 0.2, y: 0.8 }]]) {

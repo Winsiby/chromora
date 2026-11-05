@@ -24,7 +24,7 @@ class CompositionTests(unittest.TestCase):
         source = np.arange(4 * 6 * 3, dtype=np.float32).reshape((4, 6, 3)) / 100
         composition = imaging.validate_composition({
             "crop": {"x": 0.25, "y": 0.25, "width": 0.5, "height": 0.5},
-            "aspect": "1:1",
+            "aspect": "free",
             "rotation": 0,
             "straighten": 0,
         })
@@ -55,7 +55,7 @@ class CompositionTests(unittest.TestCase):
     def test_jpeg_and_tiff_exports_use_the_same_crop_dimensions(self):
         settings = {"composition": {
             "crop": {"x": 0.25, "y": 0.25, "width": 0.5, "height": 0.5},
-            "aspect": "1:1",
+            "aspect": "free",
             "rotation": 90,
             "straighten": 0,
         }}

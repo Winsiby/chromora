@@ -253,6 +253,36 @@ def _resize_float(rgb, width, height):
     return resized
 
 
+def _crop_pixel_bounds(width, height, crop, aspect):
+    left = min(width - 1, max(0, math.floor(crop["x"] * width)))
+    top = min(height - 1, max(0, math.floor(crop["y"] * height)))
+    right = min(width, max(left + 1, math.ceil((crop["x"] + crop["width"]) * width)))
+    bottom = min(height, max(top + 1, math.ceil((crop["y"] + crop["height"]) * height)))
+    if aspect == "free":
+        return left, top, right, bottom
+
+    if aspect == "original":
+        numerator, denominator = width, height
+    else:
+        numerator, denominator = (int(part) for part in aspect.split(":"))
+    divisor = math.gcd(numerator, denominator)
+    numerator //= divisor
+    denominator //= divisor
+    units = min((right - left) // numerator, (bottom - top) // denominator)
+    if units < 1:
+        return left, top, right, bottom
+
+    output_width = numerator * units
+    output_height = denominator * units
+    center_x = (crop["x"] + crop["width"] / 2) * width
+    center_y = (crop["y"] + crop["height"] / 2) * height
+    left = round(center_x - output_width / 2)
+    top = round(center_y - output_height / 2)
+    left = max(math.floor(crop["x"] * width), min(right - output_width, left))
+    top = max(math.floor(crop["y"] * height), min(bottom - output_height, top))
+    return left, top, left + output_width, top + output_height
+
+
 def _apply_composition(rgb, composition):
     channel_min = rgb.min(axis=(0, 1), keepdims=True)
     channel_max = rgb.max(axis=(0, 1), keepdims=True)
@@ -263,10 +293,7 @@ def _apply_composition(rgb, composition):
     crop = composition["crop"]
     if crop is not None:
         height, width = rgb.shape[:2]
-        left = min(width - 1, max(0, math.floor(crop["x"] * width)))
-        top = min(height - 1, max(0, math.floor(crop["y"] * height)))
-        right = min(width, max(left + 1, math.ceil((crop["x"] + crop["width"]) * width)))
-        bottom = min(height, max(top + 1, math.ceil((crop["y"] + crop["height"]) * height)))
+        left, top, right, bottom = _crop_pixel_bounds(width, height, crop, composition["aspect"])
         rgb = rgb[top:bottom, left:right].copy()
 
     angle = composition["straighten"]
