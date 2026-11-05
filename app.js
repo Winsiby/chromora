@@ -725,7 +725,12 @@ function gradeWheelControls(parent) {
     wheel.addEventListener("pointermove", (event) => {
       if (event.pointerId === pointerId) updateFromPointer(event);
     });
-    wheel.addEventListener("pointerup", () => { pointerId = null; finishPhotoGesture(wheel); });
+    wheel.addEventListener("pointerup", (event) => {
+      if (event.pointerId !== pointerId) return;
+      updateFromPointer(event);
+      pointerId = null;
+      finishPhotoGesture(wheel);
+    });
     wheel.addEventListener("pointercancel", () => { pointerId = null; finishPhotoGesture(wheel, true); });
     wheel.addEventListener("lostpointercapture", () => { pointerId = null; finishPhotoGesture(wheel, true); });
     wheel.addEventListener("keydown", (event) => {
