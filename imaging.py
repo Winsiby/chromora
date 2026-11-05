@@ -512,7 +512,11 @@ def estimate_white_balance(rgb, x, y):
         raise ValueError("取样区域过亮、过暗或颜色过饱和，请点击未剪切的中性灰或白色区域。")
     brightest = float(sample.max())
     darkest = float(sample.min())
-    if (darkest <= 5 / 255 or brightest >= 250 / 255 or
+    # `_decode` normalizes 8-bit samples into float32; allow one rounding ULP
+    # around the exact byte thresholds so 5/255 and 250/255 stay inclusive.
+    threshold_epsilon = 1e-7
+    if (darkest <= 5 / 255 + threshold_epsilon or
+            brightest >= 250 / 255 - threshold_epsilon or
             (brightest - darkest) / max(brightest, 1e-9) > 0.55):
         raise ValueError("取样区域过亮、过暗或颜色过饱和，请点击未剪切的中性灰或白色区域。")
 
