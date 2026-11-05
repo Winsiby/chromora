@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>Chromora · 本地修图</title>
   <link rel="stylesheet" href="./app.css">
+  <script src="./history.js" defer></script>
   <script src="./app.js" defer></script>
 </head>
 <body>
@@ -23,6 +24,8 @@
     <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
     <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
     <symbol id="i-reset" viewBox="0 0 24 24"><path d="M4 11a8 8 0 1 1 2 7M4 4v7h7"/></symbol>
+    <symbol id="i-undo" viewBox="0 0 24 24"><path d="m9 14-5-5 5-5"/><path d="M4 9h9a7 7 0 0 1 0 14h-1"/></symbol>
+    <symbol id="i-redo" viewBox="0 0 24 24"><path d="m15 4 5 5-5 5"/><path d="M20 9h-9a7 7 0 0 0 0 14h1"/></symbol>
     <symbol id="i-fit" viewBox="0 0 24 24"><path d="M9 4H4v5m11-5h5v5M4 15v5h5m11-5v5h-5"/></symbol>
     <symbol id="i-crop" viewBox="0 0 24 24"><path d="M7 3v13a2 2 0 0 0 2 2h12M3 7h13a2 2 0 0 1 2 2v12"/><path d="M7 7h10v10"/></symbol>
     <symbol id="i-arrow" viewBox="0 0 24 24"><path d="m9 7-5 5 5 5m6-10 5 5-5 5"/></symbol>
@@ -60,6 +63,10 @@
       <div class="canvas-toolbar">
         <div class="canvas-file"><svg><use href="#i-image"></use></svg><strong id="canvas-name">照片预览</strong></div>
         <div class="canvas-actions" aria-label="画布查看工具">
+          <div class="history-actions" role="group" aria-label="编辑历史">
+            <button class="icon-button" type="button" id="undo-edit" aria-label="撤销上一步" title="撤销（Ctrl+Z）" aria-keyshortcuts="Control+Z Meta+Z" disabled><svg><use href="#i-undo"></use></svg></button>
+            <button class="icon-button" type="button" id="redo-edit" aria-label="重做上一步" title="重做（Ctrl+Y 或 Ctrl+Shift+Z）" aria-keyshortcuts="Control+Y Control+Shift+Z Meta+Y Meta+Shift+Z" disabled><svg><use href="#i-redo"></use></svg></button>
+          </div>
           <button class="button small quiet clipping-toggle" type="button" id="clipping-toggle" aria-pressed="false" aria-describedby="clipping-legend" title="显示当前效果中剪切的高光与阴影，仅用于查看" disabled>剪切提示</button>
           <button class="icon-button" type="button" id="zoom-out" aria-label="缩小预览" title="缩小预览" disabled><svg><use href="#i-minus"></use></svg></button>
           <output id="zoom-label">适合窗口</output>
@@ -166,7 +173,7 @@
         </section>
         <section id="panel-project" class="tool-panel" aria-labelledby="inspector-title" hidden>
           <div class="section-heading"><h3>本地项目</h3></div>
-          <label class="field">项目名称<input id="project-name" maxlength="80" autocomplete="off" value="未命名项目"></label>
+          <label class="field"><span class="project-name-caption">项目名称<span id="project-dirty-indicator" class="project-dirty-dot" role="img" aria-label="有未保存的修改" hidden></span></span><input id="project-name" maxlength="80" autocomplete="off" value="未命名项目"></label>
           <div class="two-buttons">
             <button type="button" class="button outline" id="project-open"><svg><use href="#i-open"></use></svg>打开项目</button>
             <button type="button" class="button primary" id="project-save" disabled>保存项目</button>

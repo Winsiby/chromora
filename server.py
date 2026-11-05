@@ -42,7 +42,8 @@ LUT_ID = re.compile(r"[a-f0-9]{64}")
 FORMATS = {"jpeg": ".jpg", "tiff": ".tif", "psd": ".psd"}
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/app.css": ("app.css", "text/css; charset=utf-8"),
-          "/app.js": ("app.js", "text/javascript; charset=utf-8")}
+          "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+          "/history.js": ("history.js", "text/javascript; charset=utf-8")}
 IMAGE_JOBS = threading.Semaphore(1)
 
 

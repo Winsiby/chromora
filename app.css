@@ -58,6 +58,8 @@ h1, h2, h3, p { margin: 0; }
 .canvas-file { color: var(--subtle); min-width: 0; }
 .canvas-file strong { font-size: 12px; color: var(--muted); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .canvas-actions { flex: none; color: var(--muted); font-size: 11px; }
+.history-actions { display: flex; align-items: center; gap: 2px; padding-right: 6px; margin-right: 2px; border-right: 1px solid var(--edge); }
+.history-actions .icon-button { width: 25px; height: 25px; }
 .canvas-actions output { min-width: 52px; text-align: center; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .actual-button[aria-pressed=true] { color: var(--accent); border-color: var(--accent); }
 .clipping-toggle { font-weight: 500; }
@@ -141,6 +143,8 @@ h1, h2, h3, p { margin: 0; }
 .lut-star[aria-pressed=true] { color: var(--accent); }
 .lut-star[aria-pressed=true] svg { fill: var(--accent); }
 .field { display: grid; gap: 6px; color: var(--muted); font-size: 12px; margin: 0 0 12px; }
+.project-name-caption { display: inline-flex; align-items: center; gap: 7px; }
+.project-dirty-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 2px #dfb58824; }
 .field input, .field select { width: 100%; min-height: 33px; color: var(--text); background: var(--well); border: 1px solid #46515e; border-radius: 4px; padding: 6px 8px; }
 .two-buttons > * { flex: 1; }
 .capabilities { margin: 6px 0; padding-left: 16px; color: var(--muted); font-size: 11px; line-height: 1.65; }

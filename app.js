@@ -80,6 +80,10 @@ let currentId = null;
 let tab = "landscape";
 let capability = null;
 let dirty = false;
+let savedProjectBaseline = null;
+const photoHistory = typeof ChromoraHistory !== "undefined" ? new ChromoraHistory.PhotoHistory() : null;
+const photoGestures = new Map();
+let projectSaveInFlight = false;
 let comparing = true;
 let split = 50;
 let zoom = 1;
@@ -90,6 +94,8 @@ let fullOriginal;
 let favoritesOnly = false;
 let editingRegion = false;
 let regionDraft = null;
+let regionEditBefore = null;
+let regionStartDraft = null;
 let pointerStart = null;
 let selectedMaskId = null;
 let maskDrawType = null;
@@ -242,6 +248,183 @@ function renderPayload(photo) {
   return { id: photo.id, name: photo.name, settings: photo.settings, lutId: photo.lutId };
 }
 
+function cloneData(value) {
+  if (typeof structuredClone === "function") return structuredClone(value);
+  return JSON.parse(JSON.stringify(value));
+}
+
+function photoSnapshot(photo) {
+  return { settings: cloneData(photo.settings), lutId: photo.lutId ?? null };
+}
+
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableValue(value[key])]));
+  }
+  return value;
+}
+
+function dirtyProjectSnapshot(name = byId("project-name")?.value.trim() || "未命名项目", list = photos) {
+  return JSON.stringify(stableValue({
+    name,
+    photos: list.map((photo) => ({
+      id: photo.id,
+      name: photo.name,
+      settings: photo.settings,
+      lutId: photo.lutId ?? null
+    }))
+  }));
+}
+
+function updateDirtyState() {
+  dirty = photos.length > 0 && (savedProjectBaseline === null ||
+    dirtyProjectSnapshot() !== savedProjectBaseline);
+  const photo = currentPhoto();
+  const title = byId("workspace-title");
+  const indicator = byId("project-dirty-indicator");
+  if (indicator) indicator.hidden = !dirty;
+  if (title) title.textContent = photo
+    ? byId("project-name").value + (dirty ? " •" : "")
+    : "未打开照片";
+}
+
+function syncHistoryButtons() {
+  const photo = currentPhoto();
+  const undo = byId("undo-edit");
+  const redo = byId("redo-edit");
+  if (undo) undo.disabled = !photo || !photoHistory?.canUndo(photo.id);
+  if (redo) redo.disabled = !photo || !photoHistory?.canRedo(photo.id);
+}
+
+function findPhoto(photoId) {
+  return photos.find((photo) => photo.id === photoId);
+}
+
+function applyPhotoSnapshot(photo, snapshot) {
+  photo.settings = cloneData(snapshot.settings);
+  photo.lutId = snapshot.lutId ?? null;
+}
+
+function recordPhotoEdit(photo, before) {
+  if (!photo || !photoHistory) return false;
+  const changed = photoHistory.record(photo.id, before, photoSnapshot(photo));
+  updateDirtyState();
+  syncHistoryButtons();
+  return changed;
+}
+
+function runPhotoEdit(photo, mutate) {
+  if (!photo) return false;
+  const before = photoSnapshot(photo);
+  mutate(photo);
+  return recordPhotoEdit(photo, before);
+}
+
+function mutatePhoto(photo, mutate) {
+  if (!photo) return false;
+  const gesture = activeGestureFor(photo.id);
+  const before = gesture?.before || photoSnapshot(photo);
+  mutate(photo);
+  return gesture ? false : recordPhotoEdit(photo, before);
+}
+
+function beginPhotoGesture(owner, photo = currentPhoto(), before = null) {
+  if (!photo || photoGestures.has(owner)) return;
+  photoGestures.set(owner, { photoId: photo.id, before: before || photoSnapshot(photo) });
+}
+
+function activeGestureFor(photoId) {
+  for (const gesture of photoGestures.values()) {
+    if (gesture.photoId === photoId) return gesture;
+  }
+  return null;
+}
+
+function finishPhotoGesture(owner, cancel = false) {
+  const gesture = photoGestures.get(owner);
+  if (!gesture) return;
+  photoGestures.delete(owner);
+  const photo = findPhoto(gesture.photoId);
+  if (!photo) return;
+  if (cancel) applyPhotoSnapshot(photo, gesture.before);
+  else recordPhotoEdit(photo, gesture.before);
+  if (cancel && photo.id === currentId) {
+    selectedMaskId = currentMasks(photo).some((mask) => mask.id === selectedMaskId)
+      ? selectedMaskId : (currentMasks(photo)[0]?.id || null);
+    drawLuts();
+    syncControls();
+    schedulePreview();
+  }
+  updateDirtyState();
+  syncHistoryButtons();
+}
+
+function finishPhotoGestures(cancel = false) {
+  for (const owner of [...photoGestures.keys()]) finishPhotoGesture(owner, cancel);
+}
+
+function bindRangeGesture(input, onInput) {
+  const keys = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"]);
+  input.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || event.isPrimary === false) return;
+    beginPhotoGesture(input);
+    try { input.setPointerCapture(event.pointerId); } catch {}
+  });
+  input.addEventListener("input", (event) => {
+    if (!photoGestures.has(input)) beginPhotoGesture(input);
+    onInput(event);
+  });
+  input.addEventListener("pointerup", () => finishPhotoGesture(input));
+  input.addEventListener("pointercancel", () => finishPhotoGesture(input, true));
+  input.addEventListener("lostpointercapture", () => finishPhotoGesture(input, true));
+  input.addEventListener("keydown", (event) => {
+    if (keys.has(event.key)) beginPhotoGesture(input);
+  });
+  input.addEventListener("keyup", (event) => {
+    if (keys.has(event.key)) finishPhotoGesture(input);
+  });
+  input.addEventListener("change", () => finishPhotoGesture(input));
+  input.addEventListener("blur", () => finishPhotoGesture(input));
+}
+
+function refreshAfterHistory(photo) {
+  selectedMaskId = currentMasks(photo).some((mask) => mask.id === selectedMaskId)
+    ? selectedMaskId : (currentMasks(photo)[0]?.id || null);
+  maskDrawType = null;
+  drawLuts();
+  renderMaskList();
+  syncControls();
+  updateRegionOverlay();
+  schedulePreview();
+}
+
+function undoCurrentPhoto() {
+  const photo = currentPhoto();
+  if (!photo || !photoHistory) return;
+  const snapshot = photoHistory.undo(photo.id, photoSnapshot(photo));
+  if (!snapshot) return;
+  applyPhotoSnapshot(photo, snapshot);
+  refreshAfterHistory(photo);
+  syncHistoryButtons();
+  setStatus("已撤销上一步");
+}
+
+function redoCurrentPhoto() {
+  const photo = currentPhoto();
+  if (!photo || !photoHistory) return;
+  const snapshot = photoHistory.redo(photo.id, photoSnapshot(photo));
+  if (!snapshot) return;
+  applyPhotoSnapshot(photo, snapshot);
+  refreshAfterHistory(photo);
+  syncHistoryButtons();
+  setStatus("已重做上一步");
+}
+
+function isEditableShortcutTarget(target) {
+  return Boolean(target?.closest?.('input:not([type="range"]), textarea, select, [contenteditable=""], [contenteditable="true"], [role="textbox"]') || target?.isContentEditable);
+}
+
 function whiteBalancePreviewPending() {
   const chip = byId("render-chip");
   return !chip.hidden && chip.textContent.startsWith("正在");
@@ -316,9 +499,10 @@ async function sampleWhiteBalance(event) {
       throw new Error("取样返回的白平衡数值无效，请重试。");
     }
     // The endpoint returns absolute slider values, never deltas.
+    const before = photoSnapshot(photo);
     photo.settings.temperature = result.temperature;
     photo.settings.tint = result.tint;
-    dirty = true;
+    recordPhotoEdit(photo, before);
     setWhiteBalanceMode(false, true);
     syncControls();
     schedulePreview();
@@ -366,7 +550,7 @@ function controlGroup(container, title, keys, suffix) {
       input.value = initial;
       input.disabled = true;
     }
-    slider.addEventListener("input", () => setControl(key, slider.valueAsNumber));
+    bindRangeGesture(slider, () => setControl(key, slider.valueAsNumber));
     number.addEventListener("change", () => {
       if (!Number.isFinite(number.valueAsNumber)) {
         syncControls();
@@ -534,15 +718,16 @@ function gradeWheelControls(parent) {
       if (!currentPhoto() || event.button !== 0 || event.isPrimary === false) return;
       event.preventDefault();
       pointerId = event.pointerId;
+      beginPhotoGesture(wheel);
       wheel.setPointerCapture(pointerId);
       updateFromPointer(event);
     });
     wheel.addEventListener("pointermove", (event) => {
       if (event.pointerId === pointerId) updateFromPointer(event);
     });
-    for (const eventName of ["pointerup", "pointercancel", "lostpointercapture"]) {
-      wheel.addEventListener(eventName, () => { pointerId = null; });
-    }
+    wheel.addEventListener("pointerup", () => { pointerId = null; finishPhotoGesture(wheel); });
+    wheel.addEventListener("pointercancel", () => { pointerId = null; finishPhotoGesture(wheel, true); });
+    wheel.addEventListener("lostpointercapture", () => { pointerId = null; finishPhotoGesture(wheel, true); });
     wheel.addEventListener("keydown", (event) => {
       const photo = currentPhoto();
       if (!photo) return;
@@ -575,15 +760,17 @@ function setControl(key, value) {
   if (whiteBalanceBusy && (key === "temperature" || key === "tint")) setWhiteBalanceMode(false);
   const [, min, max, step] = controls[key];
   const rounded = Number((Math.round(value / step) * step).toFixed(2));
-  photo.settings[key] = Math.max(min, Math.min(max, rounded));
-  dirty = true;
+  const next = Math.max(min, Math.min(max, rounded));
+  const before = photoSnapshot(photo);
+  if (photo.settings[key] === next) return;
+  photo.settings[key] = next;
+  if (!activeGestureFor(photo.id)) recordPhotoEdit(photo, before);
   syncControls();
   schedulePreview();
 }
 
 function syncWorkspaceTitle() {
-  const photo = currentPhoto();
-  byId("workspace-title").textContent = photo ? byId("project-name").value + (dirty ? " •" : "") : "未打开照片";
+  updateDirtyState();
 }
 
 function syncControls() {
@@ -602,7 +789,7 @@ function syncControls() {
   syncGradeWheels();
 
   byId("reset-photo").disabled = !photo;
-  byId("project-save").disabled = !photo;
+  byId("project-save").disabled = !photo || projectSaveInFlight;
   byId("patchy-open").disabled = !photo || !capability?.patchy;
   byId("choose-region").disabled = !photo;
   byId("clear-region").disabled = !photo?.settings.skinRegion;
@@ -617,6 +804,7 @@ function syncControls() {
   syncCompositionPanel();
   syncWhiteBalanceTool();
   updateViewControls();
+  syncHistoryButtons();
 }
 
 function editorSection(parent, id, title, open = false) {
@@ -719,12 +907,13 @@ function drawCurve() {
 function saveCurve(points) {
   const photo = currentPhoto();
   if (!photo) return;
+  const before = photoSnapshot(photo);
   const curves = { ...photo.settings.curves };
   if (points) curves[curveChannel] = points;
   else delete curves[curveChannel];
   if (Object.keys(curves).length) photo.settings.curves = curves;
   else delete photo.settings.curves;
-  dirty = true;
+  if (!activeGestureFor(photo.id)) recordPhotoEdit(photo, before);
   syncControls();
   schedulePreview();
 }
@@ -781,12 +970,16 @@ function prepareCurve(parent) {
     return [round((point.x - 10) / 2), round((210 - point.y) / 2)];
   }
   graph.addEventListener("pointerdown", (event) => {
-    if (!currentPhoto() || event.button !== 0) return;
+    const photo = currentPhoto();
+    if (!photo || event.button !== 0 || event.isPrimary === false) return;
+    const before = photoSnapshot(photo);
+    beginPhotoGesture(graph, photo, before);
     const handle = event.target.dataset.curveIndex;
     if (handle !== undefined) {
       curvePoint = Number(handle);
       drawCurve();
     } else if (!addCurvePoint(...coordinate(event))) {
+      finishPhotoGesture(graph, true);
       return;
     }
     event.preventDefault();
@@ -796,7 +989,22 @@ function prepareCurve(parent) {
   graph.addEventListener("pointermove", (event) => {
     if (event.pointerId === pointer && currentPhoto()) moveCurvePoint(...coordinate(event));
   });
-  graph.addEventListener("lostpointercapture", () => { pointer = null; });
+  graph.addEventListener("pointerup", (event) => {
+    if (event.pointerId !== pointer) return;
+    moveCurvePoint(...coordinate(event));
+    pointer = null;
+    finishPhotoGesture(graph);
+  });
+  graph.addEventListener("pointercancel", (event) => {
+    if (event.pointerId !== pointer) return;
+    pointer = null;
+    finishPhotoGesture(graph, true);
+  });
+  graph.addEventListener("lostpointercapture", () => {
+    if (pointer === null) return;
+    pointer = null;
+    finishPhotoGesture(graph, true);
+  });
   byId("curve-section").addEventListener("toggle", () => {
     if (byId("curve-section").open) drawCurve();
   });
@@ -901,8 +1109,7 @@ function renderMaskList() {
     enabled.title = mask.enabled ? "停用蒙版" : "启用蒙版";
     enabled.textContent = mask.enabled ? "开" : "关";
     enabled.addEventListener("click", () => {
-      mask.enabled = !mask.enabled;
-      dirty = true;
+      mutatePhoto(photo, () => { mask.enabled = !mask.enabled; });
       syncWorkspaceTitle();
       renderMaskList();
       syncMaskPanel();
@@ -918,9 +1125,8 @@ function renderMaskList() {
     remove.textContent = "×";
     remove.addEventListener("click", () => {
       const index = masks.findIndex((entry) => entry.id === mask.id);
-      if (index >= 0) masks.splice(index, 1);
+      mutatePhoto(photo, () => { if (index >= 0) masks.splice(index, 1); });
       if (selectedMaskId === mask.id) selectedMaskId = masks[Math.min(index, masks.length - 1)]?.id || null;
-      dirty = true;
       syncWorkspaceTitle();
       renderMaskList();
       syncMaskPanel();
@@ -995,10 +1201,9 @@ function prepareMaskPanel() {
   for (const [id, type] of [["mask-add-linear", "linear"], ["mask-add-radial", "radial"]]) {
     byId(id).addEventListener("click", () => {
       const mask = createMask(type);
-      currentMasks().push(mask);
+      runPhotoEdit(currentPhoto(), (photo) => currentMasks(photo).push(mask));
       selectedMaskId = mask.id;
       maskDrawType = type;
-      dirty = true;
       syncWorkspaceTitle();
       renderMaskList();
       syncMaskPanel();
@@ -1041,13 +1246,12 @@ function prepareMaskPanel() {
       const raw = Number(event.currentTarget.value);
       if (!Number.isFinite(raw)) return;
       const value = Math.max(min, Math.min(max, Number((Math.round(raw / step) * step).toFixed(2))));
-      mask.adjustments[key] = value;
+      mutatePhoto(currentPhoto(), () => { mask.adjustments[key] = value; });
       for (const input of selectAll('[data-mask-control="' + key + '"]')) input.value = value;
-      dirty = true;
       syncWorkspaceTitle();
       schedulePreview();
     };
-    range.addEventListener("input", change);
+    bindRangeGesture(range, change);
     number.addEventListener("change", change);
     row.append(title, range, number);
     container.append(row);
@@ -1060,17 +1264,15 @@ function prepareMaskPanel() {
       event.currentTarget.value = mask.name;
       return;
     }
-    mask.name = name.slice(0, 60);
-    dirty = true;
+    mutatePhoto(currentPhoto(), () => { mask.name = name.slice(0, 60); });
     syncWorkspaceTitle();
     renderMaskList();
   });
-  byId("mask-feather").addEventListener("input", (event) => {
+  bindRangeGesture(byId("mask-feather"), (event) => {
     const mask = selectedMask();
     if (!mask || mask.type !== "radial") return;
-    mask.feather = event.currentTarget.valueAsNumber;
+    mutatePhoto(currentPhoto(), () => { mask.feather = event.currentTarget.valueAsNumber; });
     byId("mask-feather-value").textContent = Math.round(mask.feather * 100) + "%";
-    dirty = true;
     syncWorkspaceTitle();
     updateMaskOverlay();
     schedulePreview();
@@ -1078,8 +1280,7 @@ function prepareMaskPanel() {
   byId("mask-invert").addEventListener("click", () => {
     const mask = selectedMask();
     if (!mask) return;
-    mask.invert = !mask.invert;
-    dirty = true;
+    mutatePhoto(currentPhoto(), () => { mask.invert = !mask.invert; });
     syncWorkspaceTitle();
     syncMaskPanel();
     schedulePreview();
@@ -1342,9 +1543,8 @@ function preparePanels() {
   byId("clear-region").addEventListener("click", () => {
     const photo = currentPhoto();
     if (!photo) return;
-    delete photo.settings.skinRegion;
+    runPhotoEdit(photo, (target) => { delete target.settings.skinRegion; });
     finishRegion(false);
-    dirty = true;
     syncControls();
     schedulePreview();
   });
@@ -1367,7 +1567,7 @@ function prepareCompositionPanel() {
   });
   byId("rotate-left").addEventListener("click", () => rotateComposition(-90));
   byId("rotate-right").addEventListener("click", () => rotateComposition(90));
-  byId("straighten-range").addEventListener("input", (event) => {
+  bindRangeGesture(byId("straighten-range"), (event) => {
     const value = Math.max(-15, Math.min(15, Math.round(event.currentTarget.valueAsNumber * 10) / 10));
     changeComposition((composition) => { composition.straighten = value; });
   });
@@ -1469,7 +1669,9 @@ async function importPhotos(files) {
         if (typeof info.id !== "string") throw new Error("未取得照片编号");
         const existing = photos.find((photo) => photo.id === info.id);
         if (!existing) {
-          photos.push({ id: info.id, name: info.name || file.name, raw: Boolean(info.raw), settings: { ...defaults, masks: [] }, lutId: null });
+          const photo = { id: info.id, name: info.name || file.name, raw: Boolean(info.raw), settings: { ...defaults, masks: [] }, lutId: null };
+          photos.push(photo);
+          photoHistory?.reset(photo.id, photoSnapshot(photo));
         }
         imported.push(info.id);
       } catch (error) {
@@ -1477,7 +1679,7 @@ async function importPhotos(files) {
       }
     }
     if (imported.length) {
-      dirty = true;
+      updateDirtyState();
       drawFilmstrip();
       await selectPhoto(imported[0]);
     }
@@ -1763,18 +1965,17 @@ function updateCompositionGesture(event) {
   } else {
     composition.crop = resizeCropCorner(start, compositionGesture.handle, point, composition);
   }
-  dirty = true;
+  updateDirtyState();
   updateCompositionOverlay();
 }
 
 function changeComposition(mutator, preview = true) {
   const photo = currentPhoto();
   if (!photo) return;
-  mutator(ensureComposition(photo));
+  mutatePhoto(photo, (target) => mutator(ensureComposition(target)));
   actualZoom = false;
   zoom = 1;
   byId("view").classList.remove("actual-size", "scrollable");
-  dirty = true;
   syncCompositionPanel();
   if (tab === "composition") {
     fitCompositionStage();
@@ -1881,6 +2082,7 @@ function waitForImage(image) {
 
 async function selectPhoto(id, force = false) {
   if (id === currentId && originalUrl && !force) return;
+  finishPhotoGestures(true);
   setWhiteBalanceMode(false);
   clearTimeout(renderTimer);
   clearTimeout(fullRenderTimer);
@@ -2241,8 +2443,7 @@ function drawLuts() {
 function applyLut(id) {
   const photo = currentPhoto();
   if (!photo) return;
-  photo.lutId = id;
-  dirty = true;
+  mutatePhoto(photo, () => { photo.lutId = id; });
   drawLuts();
   syncControls();
   schedulePreview();
@@ -2285,6 +2486,7 @@ function beginRegion() {
     return;
   }
   editingRegion = true;
+  regionEditBefore = photoSnapshot(photo);
   peekingOriginal = false;
   regionDraft = { ...(photo.settings.skinRegion || { x: 0.28, y: 0.24, width: 0.44, height: 0.52 }) };
   const stack = byId("photo-stack");
@@ -2301,13 +2503,15 @@ function beginRegion() {
 function finishRegion(apply) {
   const photo = currentPhoto();
   if (apply && photo && regionDraft?.width >= 0.02 && regionDraft?.height >= 0.02) {
+    const before = regionEditBefore || photoSnapshot(photo);
     photo.settings.skinRegion = { ...regionDraft };
-    dirty = true;
+    recordPhotoEdit(photo, before);
     setStatus("已设置皮肤区域");
   } else {
     apply = false;
   }
   editingRegion = false;
+  regionEditBefore = null;
   pointerStart = null;
   regionDraft = null;
   const stack = byId("photo-stack");
@@ -2381,12 +2585,13 @@ function setupPresets(panel, group, keys) {
     const photo = currentPhoto();
     const preset = (preferences.presets[group] || [])[Number(picker.value)];
     if (!photo || picker.value === "" || !preset) return;
-    for (const key of keys) photo.settings[key] = preset.values[key] ?? defaults[key];
-    if (group === "landscape") {
-      if (preset.values.curves) photo.settings.curves = structuredClone(preset.values.curves);
-      else delete photo.settings.curves;
-    }
-    dirty = true;
+    runPhotoEdit(photo, (target) => {
+      for (const key of keys) target.settings[key] = preset.values[key] ?? defaults[key];
+      if (group === "landscape") {
+        if (preset.values.curves) target.settings.curves = cloneData(preset.values.curves);
+        else delete target.settings.curves;
+      }
+    });
     syncControls();
     schedulePreview();
     picker.value = "";
@@ -2427,22 +2632,29 @@ async function loadProjectList() {
 }
 
 async function saveProject() {
-  if (!currentPhoto()) return;
+  if (!currentPhoto() || projectSaveInFlight) return;
   const name = byId("project-name").value.trim();
   if (!name) {
     setStatus("请输入项目名称。", "error");
     byId("project-name").focus();
     return;
   }
-  const state = { photos, currentId, luts: preferences.luts, favorites: preferences.favorites };
+  const state = cloneData({ photos, currentId, luts: preferences.luts, favorites: preferences.favorites });
+  const submittedBaseline = dirtyProjectSnapshot(name, state.photos);
+  projectSaveInFlight = true;
+  byId("project-save").disabled = true;
   try {
     await post("/api/project", { name, state });
-    dirty = false;
+    savedProjectBaseline = submittedBaseline;
     byId("project-info").textContent = "已保存 " + name + "。";
+    updateDirtyState();
     syncControls();
     setStatus("项目已保存到本机");
   } catch (error) {
     setStatus("保存项目失败：" + error.message, "error");
+  } finally {
+    projectSaveInFlight = false;
+    syncControls();
   }
 }
 
@@ -2459,11 +2671,16 @@ async function restoreProject(event) {
   try {
     const response = await request("/api/project?name=" + encodeURIComponent(name));
     const project = await response.json();
-    if (!Array.isArray(project.state?.photos)) throw new Error("项目中的照片列表无效。");
-    photos = project.state.photos.map((photo) => ({
+    if (!Array.isArray(project.state?.photos) || typeof project.name !== "string") throw new Error("项目中的照片列表或名称无效。");
+    const nextPhotos = project.state.photos.map((photo) => ({
       ...photo,
       settings: { ...defaults, ...photo.settings, masks: Array.isArray(photo.settings?.masks) ? photo.settings.masks : [] }
     }));
+    finishPhotoGestures(true);
+    photos = nextPhotos;
+    photoHistory?.resetAll(photos.map((photo) => [photo.id, photoSnapshot(photo)]));
+    selectedMaskId = null;
+    maskDrawType = null;
     for (const lut of project.state.luts || []) {
       if (!preferences.luts.some((entry) => entry.id === lut.id)) preferences.luts.push(lut);
     }
@@ -2471,7 +2688,8 @@ async function restoreProject(event) {
     savePreferences();
     byId("project-name").value = project.name;
     byId("project-info").textContent = "已打开 " + project.name + "。";
-    dirty = false;
+    savedProjectBaseline = dirtyProjectSnapshot(project.name, photos);
+    updateDirtyState();
     byId("project-dialog").close();
     drawFilmstrip();
     await selectPhoto(photos.some((photo) => photo.id === project.state.currentId)
@@ -2572,6 +2790,16 @@ function wireEvents() {
   window.addEventListener("resize", fitVisibleImage);
 
   window.addEventListener("keydown", (event) => {
+    const modifier = event.ctrlKey || event.metaKey;
+    if (modifier && !event.altKey && !event.defaultPrevented && !isEditableShortcutTarget(event.target) && !document.querySelector("dialog[open]")) {
+      const key = event.key.toLowerCase();
+      if (key === "z" || key === "y") {
+        event.preventDefault();
+        if (key === "y" || event.shiftKey) redoCurrentPhoto();
+        else undoCurrentPhoto();
+        return;
+      }
+    }
     if (event.key === "Escape" && whiteBalanceActive) {
       event.preventDefault();
       setWhiteBalanceMode(false, true);
@@ -2603,11 +2831,12 @@ function wireEvents() {
     const photo = currentPhoto();
     if (!photo) return;
     setWhiteBalanceMode(false);
-    photo.settings = { ...defaults, masks: [] };
-    photo.lutId = null;
+    runPhotoEdit(photo, (target) => {
+      target.settings = { ...defaults, masks: [] };
+      target.lutId = null;
+    });
     selectedMaskId = null;
     maskDrawType = null;
-    dirty = true;
     if (editingRegion) finishRegion(false);
     updateRegionOverlay();
     renderMaskList();
@@ -2624,6 +2853,7 @@ function wireEvents() {
   on("photo-stack", "pointerdown", (event) => {
     if (!editingRegion || event.button !== 0) return;
     event.preventDefault();
+    regionStartDraft = regionDraft ? { ...regionDraft } : null;
     pointerStart = regionPoint(event);
     stack.setPointerCapture(event.pointerId);
   });
@@ -2632,17 +2862,25 @@ function wireEvents() {
     if (!pointerStart) return;
     regionMove(event);
     pointerStart = null;
+    regionStartDraft = null;
     if (regionDraft.width >= 0.02 && regionDraft.height >= 0.02) finishRegion(true);
   });
-  on("photo-stack", "pointercancel", () => { pointerStart = null; });
+  on("photo-stack", "pointercancel", () => {
+    pointerStart = null;
+    regionDraft = regionStartDraft ? { ...regionStartDraft } : regionDraft;
+    regionStartDraft = null;
+    updateRegionOverlay();
+  });
   on("photo-stack", "keydown", regionKey);
   on("region-apply", "click", () => finishRegion(true));
 
   const maskCanvas = byId("mask-overlay");
   maskCanvas.addEventListener("pointerdown", (event) => {
     if (tab !== "masks" || !currentPhoto() || event.button !== 0) return;
+    const photo = currentPhoto();
     const handle = event.target.closest?.("[data-mask-handle]");
     if (handle) {
+      beginPhotoGesture(maskCanvas, photo);
       selectedMaskId = handle.dataset.maskId;
       renderMaskList();
       syncMaskPanel();
@@ -2654,6 +2892,7 @@ function wireEvents() {
     if (!maskDrawType || !event.target.closest?.(".mask-overlay")) return;
     const mask = selectedMask();
     if (!mask) return;
+    beginPhotoGesture(maskCanvas, photo);
     const point = maskPoint(event);
     if (maskDrawType === "linear") mask.geometry = { start: { ...point }, end: { ...point } };
     else mask.geometry = { center: { ...point }, radius: { x: 0.01, y: 0.01 } };
@@ -2672,7 +2911,7 @@ function wireEvents() {
     const wasDrawing = Boolean(maskGesture.drawType);
     maskGesture = null;
     if (wasDrawing) maskDrawType = null;
-    dirty = true;
+    finishPhotoGesture(maskCanvas);
     syncWorkspaceTitle();
     syncMaskPanel();
     schedulePreview();
@@ -2683,8 +2922,17 @@ function wireEvents() {
     const wasDrawing = Boolean(maskGesture.drawType);
     maskGesture = null;
     if (wasDrawing) maskDrawType = null;
-    dirty = true;
+    finishPhotoGesture(maskCanvas, true);
     syncWorkspaceTitle();
+    syncMaskPanel();
+    schedulePreview();
+  });
+  maskCanvas.addEventListener("lostpointercapture", () => {
+    if (!maskGesture) return;
+    const wasDrawing = Boolean(maskGesture.drawType);
+    maskGesture = null;
+    if (wasDrawing) maskDrawType = null;
+    finishPhotoGesture(maskCanvas, true);
     syncMaskPanel();
     schedulePreview();
   });
@@ -2704,8 +2952,9 @@ function wireEvents() {
     else point = { x: mask.geometry.center.x, y: mask.geometry.center.y + mask.geometry.radius.y };
     const screenPoint = sourcePointToOutput(point);
     const sourcePoint = outputPointToSource({ x: screenPoint.x + delta[0], y: screenPoint.y + delta[1] });
-    moveMaskHandle(mask, key, { x: Math.max(0, Math.min(1, sourcePoint.x)), y: Math.max(0, Math.min(1, sourcePoint.y)) });
-    dirty = true;
+    mutatePhoto(currentPhoto(), () => moveMaskHandle(mask, key, {
+      x: Math.max(0, Math.min(1, sourcePoint.x)), y: Math.max(0, Math.min(1, sourcePoint.y))
+    }));
     syncWorkspaceTitle();
     updateMaskOverlay();
     schedulePreview();
@@ -2719,8 +2968,9 @@ function wireEvents() {
     const moveTarget = event.target.closest?.("[data-crop-move]");
     if (!handle && !moveTarget) return;
     event.preventDefault();
-    const before = photo.settings.composition ? structuredClone(photo.settings.composition) : null;
-    const composition = ensureComposition(photo);
+    const before = photo.settings.composition ? cloneData(photo.settings.composition) : null;
+    beginPhotoGesture(cropCanvas, photo);
+    const composition = photoComposition(photo);
     compositionGesture = {
       pointerId: event.pointerId,
       kind: handle ? "resize" : "move",
@@ -2736,19 +2986,22 @@ function wireEvents() {
     if (!compositionGesture || compositionGesture.pointerId !== event.pointerId) return;
     updateCompositionGesture(event);
     compositionGesture = null;
+    finishPhotoGesture(cropCanvas);
     syncCompositionPanel();
     schedulePreview();
     setStatus("已更新裁剪范围");
   });
   cropCanvas.addEventListener("pointercancel", (event) => {
     if (!compositionGesture || compositionGesture.pointerId !== event.pointerId) return;
-    const before = compositionGesture.before;
-    const photo = currentPhoto();
-    if (photo) {
-      if (before) photo.settings.composition = before;
-      else delete photo.settings.composition;
-    }
+    finishPhotoGesture(cropCanvas, true);
     compositionGesture = null;
+    syncCompositionPanel();
+    fitCompositionStage();
+  });
+  cropCanvas.addEventListener("lostpointercapture", () => {
+    if (!compositionGesture) return;
+    compositionGesture = null;
+    finishPhotoGesture(cropCanvas, true);
     syncCompositionPanel();
     fitCompositionStage();
   });
@@ -2759,6 +3012,7 @@ function wireEvents() {
     const movement = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[event.key];
     if (!movement) return;
     event.preventDefault();
+    const before = photoSnapshot(photo);
     const composition = ensureComposition(photo);
     const crop = cropRect(composition);
     const positions = {
@@ -2771,11 +3025,32 @@ function wireEvents() {
     const step = (event.shiftKey ? 0.05 : 0.01);
     const next = screenPointToCrop({ x: screen.x + movement[0] * step, y: screen.y + movement[1] * step }, composition);
     composition.crop = resizeCropCorner(crop, handle.dataset.cropHandle, next, composition);
-    dirty = true;
+    recordPhotoEdit(photo, before);
     syncCompositionPanel();
     fitCompositionStage();
     schedulePreview();
     byId("composition-overlay").querySelector('.crop-handle[data-crop-handle="' + handle.dataset.cropHandle + '"]')?.focus();
+  });
+
+  window.addEventListener("blur", () => {
+    finishPhotoGestures(true);
+    if (maskGesture) {
+      const wasDrawing = Boolean(maskGesture.drawType);
+      maskGesture = null;
+      if (wasDrawing) maskDrawType = null;
+      syncMaskPanel();
+    }
+    if (compositionGesture) {
+      compositionGesture = null;
+      syncCompositionPanel();
+      fitCompositionStage();
+    }
+    if (pointerStart) {
+      pointerStart = null;
+      regionDraft = regionStartDraft ? { ...regionStartDraft } : regionDraft;
+      regionStartDraft = null;
+      updateRegionOverlay();
+    }
   });
 
   const drop = byId("drop-hint");
@@ -2794,7 +3069,9 @@ function wireEvents() {
     if (byId("canvas").contains(event.target)) importPhotos(event.dataTransfer.files);
   });
 
-  on("project-name", "input", () => { if (currentPhoto()) dirty = true; syncControls(); });
+  on("project-name", "input", () => syncControls());
+  on("undo-edit", "click", undoCurrentPhoto);
+  on("redo-edit", "click", redoCurrentPhoto);
   on("project-save", "click", saveProject);
   on("project-open", "click", openProject);
   on("project-form", "submit", restoreProject);
