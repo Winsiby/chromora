@@ -9,6 +9,7 @@ vendor/
 导出/
 
 # Python
+.venv/
 __pycache__/
 *.py[cod]
 
