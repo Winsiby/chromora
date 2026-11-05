@@ -92,6 +92,8 @@ let peekingOriginal = false;
 let actualZoom = false;
 let fullOriginal;
 let favoritesOnly = false;
+let photoFlagFilter = "all";
+let photoMinimumRating = 0;
 let editingRegion = false;
 let regionDraft = null;
 let regionEditBefore = null;
@@ -286,6 +288,60 @@ function photoSnapshot(photo) {
   return { settings: cloneData(photo.settings), lutId: photo.lutId ?? null };
 }
 
+function normalizePhotoCullingMetadata(photo) {
+  if (!photo || typeof photo !== "object") return photo;
+  photo.rating = Number.isInteger(photo.rating) && photo.rating >= 0 && photo.rating <= 5 ? photo.rating : 0;
+  photo.flag = photo.flag === "pick" || photo.flag === "reject" ? photo.flag : null;
+  return photo;
+}
+
+function photoMatchesFilter(photo, flagFilter = "all", minimumRating = 0) {
+  if (!photo) return false;
+  const validFilter = ["all", "pick", "reject", "unflagged"].includes(flagFilter) ? flagFilter : "all";
+  const minRating = Number.isInteger(minimumRating) && minimumRating >= 0 && minimumRating <= 5 ? minimumRating : 0;
+  const rating = Number.isInteger(photo.rating) && photo.rating >= 0 && photo.rating <= 5 ? photo.rating : 0;
+  const flag = photo.flag === "pick" || photo.flag === "reject" ? photo.flag : null;
+  if (rating < minRating) return false;
+  if (validFilter === "pick" && flag !== "pick") return false;
+  if (validFilter === "reject" && flag !== "reject") return false;
+  if (validFilter === "unflagged" && flag !== null) return false;
+  return true;
+}
+
+function filteredPhotos(list = photos, flagFilter = photoFlagFilter, minimumRating = photoMinimumRating) {
+  return list.filter((photo) => photoMatchesFilter(photo, flagFilter, minimumRating));
+}
+
+function firstPhotoToSelectAfterFilter(currentPhotoId, matchingPhotos) {
+  if (!matchingPhotos.length || matchingPhotos.some((photo) => photo.id === currentPhotoId)) return null;
+  return matchingPhotos[0];
+}
+
+function setPhotoRating(photo, rating) {
+  if (!photo || !Number.isInteger(rating) || rating < 0 || rating > 5 || (photo.rating ?? 0) === rating) return false;
+  photo.rating = rating;
+  return true;
+}
+
+function setPhotoFlag(photo, flag) {
+  if (!photo || ![null, "pick", "reject"].includes(flag) || (photo.flag ?? null) === flag) return false;
+  photo.flag = flag;
+  return true;
+}
+
+function isPhotoCullingShortcutTarget(target) {
+  return Boolean(target?.closest?.('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]') || target?.isContentEditable);
+}
+
+function photoCullingShortcutAction(event, dialogOpen = false) {
+  if (!event || event.defaultPrevented || event.isComposing || dialogOpen || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey ||
+      isPhotoCullingShortcutTarget(event.target)) return null;
+  const key = String(event.key || "").toLowerCase();
+  if (/^[0-5]$/.test(key)) return { type: "rating", value: Number(key) };
+  const flags = { p: "pick", x: "reject", u: null };
+  return Object.prototype.hasOwnProperty.call(flags, key) ? { type: "flag", value: flags[key] } : null;
+}
+
 function stableValue(value) {
   if (Array.isArray(value)) return value.map(stableValue);
   if (value && typeof value === "object") {
@@ -301,7 +357,9 @@ function dirtyProjectSnapshot(name = byId("project-name")?.value.trim() || "未�
       id: photo.id,
       name: photo.name,
       settings: photo.settings,
-      lutId: photo.lutId ?? null
+      lutId: photo.lutId ?? null,
+      rating: photo.rating ?? 0,
+      flag: photo.flag ?? null
     }))
   }));
 }
@@ -809,6 +867,7 @@ function syncWorkspaceTitle() {
 
 function syncControls() {
   const photo = currentPhoto();
+  syncPhotoCullingControls();
   const requiresRegion = capability?.portrait !== "rapidretouch";
   for (const [key, pairs] of inputPairs) {
     const isPortrait = ["blemishes", "smoothing", "skinTone", "texture"].includes(key);
@@ -1656,35 +1715,140 @@ function showCapabilities() {
   }));
 }
 
+function syncPhotoFilterControls() {
+  for (const [id, filter] of [["film-filter-all", "all"], ["film-filter-pick", "pick"], ["film-filter-reject", "reject"], ["film-filter-unflagged", "unflagged"]]) {
+    const button = byId(id);
+    if (button) button.setAttribute("aria-pressed", String(photoFlagFilter === filter));
+  }
+  const rating = byId("film-min-rating");
+  if (rating) rating.value = String(photoMinimumRating);
+}
+
+function syncPhotoCullingControls() {
+  const photo = currentPhoto();
+  for (let rating = 1; rating <= 5; rating += 1) {
+    const button = byId("photo-rating-" + rating);
+    if (!button) continue;
+    button.disabled = !photo;
+    button.setAttribute("aria-pressed", String(Boolean(photo && rating <= photo.rating)));
+  }
+  const clearRating = byId("photo-rating-clear");
+  if (clearRating) {
+    clearRating.disabled = !photo;
+    clearRating.setAttribute("aria-pressed", String(Boolean(photo && photo.rating === 0)));
+  }
+  for (const [id, flag] of [["photo-flag-pick", "pick"], ["photo-flag-reject", "reject"], ["photo-flag-clear", null]]) {
+    const button = byId(id);
+    if (!button) continue;
+    button.disabled = !photo;
+    button.setAttribute("aria-pressed", String(Boolean(photo && (photo.flag ?? null) === flag)));
+  }
+}
+
 function drawFilmstrip() {
   const container = byId("film-items");
   const previousScroll = container.scrollLeft;
-  container.replaceChildren(...photos.map((photo) => {
+  const visiblePhotos = filteredPhotos();
+  const items = visiblePhotos.map((photo) => {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "film-item";
-    button.title = photo.name;
+    const flagLabel = photo.flag === "pick" ? "入选" : photo.flag === "reject" ? "剔除" : "未标记";
+    button.title = photo.name + "，" + (photo.rating ? photo.rating + " 星" : "未评分") + "，" + flagLabel;
+    button.setAttribute("aria-label", button.title);
     button.setAttribute("aria-pressed", String(photo.id === currentId));
     const image = document.createElement("img");
     image.alt = "";
     image.loading = "lazy";
     image.src = "/api/thumb?id=" + encodeURIComponent(photo.id);
     const name = document.createElement("span");
+    name.className = "film-item-name";
     name.textContent = photo.name;
-    button.append(image, name);
+    const marks = document.createElement("span");
+    marks.className = "film-markers";
+    marks.setAttribute("aria-hidden", "true");
+    if (photo.rating > 0) {
+      const rating = document.createElement("span");
+      rating.textContent = photo.rating + "★";
+      marks.append(rating);
+    }
+    if (photo.flag) {
+      const flag = document.createElement("span");
+      flag.className = photo.flag === "pick" ? "film-marker-pick" : "film-marker-reject";
+      flag.textContent = photo.flag === "pick" ? "✓" : "×";
+      marks.append(flag);
+    }
+    button.append(image, name, marks);
     button.addEventListener("click", () => selectPhoto(photo.id));
     return button;
-  }));
+  });
+  if (items.length) {
+    container.replaceChildren(...items);
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "film-empty";
+    empty.setAttribute("role", "status");
+    const message = document.createElement("span");
+    message.textContent = photos.length ? "没有符合条件的照片。调整筛选条件，或清除筛选。" : "暂无照片。添加照片后即可开始挑片。";
+    empty.append(message);
+    if (photos.length) {
+      const clear = document.createElement("button");
+      clear.type = "button";
+      clear.id = "film-filter-clear";
+      clear.className = "button small outline";
+      clear.textContent = "清除筛选";
+      clear.addEventListener("click", () => setPhotoFilter("all", 0));
+      empty.append(clear);
+    }
+    container.replaceChildren(empty);
+  }
   container.scrollLeft = previousScroll;
-  byId("photo-count").textContent = photos.length + " 张";
+  byId("photo-count").textContent = photoFlagFilter === "all" && photoMinimumRating === 0
+    ? photos.length + " 张" : visiblePhotos.length + " / " + photos.length + " 张";
+  syncPhotoFilterControls();
 }
 
 function updateFilmSelection() {
-  const index = photos.findIndex((photo) => photo.id === currentId);
+  const index = filteredPhotos().findIndex((photo) => photo.id === currentId);
   [...byId("film-items").children].forEach((button, buttonIndex) => {
     button.setAttribute("aria-pressed", String(index === buttonIndex));
     if (index === buttonIndex) button.scrollIntoView({ block: "nearest", inline: "nearest" });
   });
+}
+
+function setPhotoFilter(flagFilter = photoFlagFilter, minimumRating = photoMinimumRating) {
+  photoFlagFilter = ["all", "pick", "reject", "unflagged"].includes(flagFilter) ? flagFilter : "all";
+  photoMinimumRating = Number.isInteger(minimumRating) && minimumRating >= 0 && minimumRating <= 5 ? minimumRating : 0;
+  syncPhotoFilterControls();
+  drawFilmstrip();
+  const visible = filteredPhotos();
+  const nextPhoto = firstPhotoToSelectAfterFilter(currentId, visible);
+  if (nextPhoto) void selectPhoto(nextPhoto.id);
+}
+
+function refreshFilmstripAfterMetadataChange() {
+  drawFilmstrip();
+  const visible = filteredPhotos();
+  const nextPhoto = firstPhotoToSelectAfterFilter(currentId, visible);
+  if (nextPhoto) void selectPhoto(nextPhoto.id);
+}
+
+function setCurrentPhotoRating(rating) {
+  const photo = currentPhoto();
+  if (!setPhotoRating(photo, rating)) return;
+  syncPhotoCullingControls();
+  updateDirtyState();
+  refreshFilmstripAfterMetadataChange();
+  setStatus(rating ? "已设为 " + rating + " 星" : "已清除星级");
+}
+
+function setCurrentPhotoFlag(flag) {
+  const photo = currentPhoto();
+  if (!setPhotoFlag(photo, flag)) return;
+  syncPhotoCullingControls();
+  updateDirtyState();
+  refreshFilmstripAfterMetadataChange();
+  setStatus(flag === "pick" ? "已标记为入选" : flag === "reject" ? "已标记为剔除" : "已清除旗标");
 }
 
 async function importPhotos(files) {
@@ -1703,7 +1867,7 @@ async function importPhotos(files) {
         if (typeof info.id !== "string") throw new Error("未取得照片编号");
         const existing = photos.find((photo) => photo.id === info.id);
         if (!existing) {
-          const photo = { id: info.id, name: info.name || file.name, raw: Boolean(info.raw), settings: { ...defaults, masks: [] }, lutId: null };
+          const photo = normalizePhotoCullingMetadata({ id: info.id, name: info.name || file.name, raw: Boolean(info.raw), settings: { ...defaults, masks: [] }, lutId: null });
           photos.push(photo);
           photoHistory?.reset(photo.id, photoSnapshot(photo));
         }
@@ -2126,7 +2290,7 @@ function waitForImage(image) {
 
 async function selectPhoto(id, force = false) {
   if (id === currentId && originalUrl && !force) return;
-  finishPhotoGestures(true);
+  finishPhotoGestures(false); // Browsing commits an in-progress edit instead of reverting its settings.
   setWhiteBalanceMode(false);
   clearTimeout(renderTimer);
   clearTimeout(fullRenderTimer);
@@ -2717,7 +2881,7 @@ async function restoreProject(event) {
     const project = await response.json();
     if (!Array.isArray(project.state?.photos) || typeof project.name !== "string") throw new Error("项目中的照片列表或名称无效。");
     const nextPhotos = project.state.photos.map((photo) => ({
-      ...photo,
+      ...normalizePhotoCullingMetadata(photo),
       settings: { ...defaults, ...photo.settings, masks: Array.isArray(photo.settings?.masks) ? photo.settings.masks : [] }
     }));
     finishPhotoGestures(true);
@@ -2728,6 +2892,9 @@ async function restoreProject(event) {
     for (const lut of project.state.luts || []) {
       if (!preferences.luts.some((entry) => entry.id === lut.id)) preferences.luts.push(lut);
     }
+    photoFlagFilter = "all";
+    photoMinimumRating = 0;
+    syncPhotoFilterControls();
     preferences.favorites = [...new Set([...preferences.favorites, ...(project.state.favorites || [])])];
     savePreferences();
     byId("project-name").value = project.name;
@@ -2803,6 +2970,8 @@ async function launchPatchy() {
 
 function wireEvents() {
   const on = (id, event, handler) => byId(id).addEventListener(event, handler);
+  syncPhotoFilterControls();
+  syncPhotoCullingControls();
   for (const id of ["open-files", "empty-open", "film-add"]) on(id, "click", () => byId("file-input").click());
   on("open-folder", "click", () => byId("folder-input").click());
   on("import-lut", "click", () => byId("lut-input").click());
@@ -2818,6 +2987,18 @@ function wireEvents() {
     importLut(event.target.files[0]);
     event.target.value = "";
   });
+
+  for (const [id, flag] of [["film-filter-all", "all"], ["film-filter-pick", "pick"], ["film-filter-reject", "reject"], ["film-filter-unflagged", "unflagged"]]) {
+    on(id, "click", () => setPhotoFilter(flag, photoMinimumRating));
+  }
+  on("film-min-rating", "change", (event) => setPhotoFilter(photoFlagFilter, Number(event.target.value)));
+  for (let rating = 1; rating <= 5; rating += 1) {
+    on("photo-rating-" + rating, "click", () => setCurrentPhotoRating(rating));
+  }
+  on("photo-rating-clear", "click", () => setCurrentPhotoRating(0));
+  on("photo-flag-pick", "click", () => setCurrentPhotoFlag("pick"));
+  on("photo-flag-reject", "click", () => setCurrentPhotoFlag("reject"));
+  on("photo-flag-clear", "click", () => setCurrentPhotoFlag(null));
 
   for (const button of selectAll("[data-tab]")) button.addEventListener("click", () => selectTab(button.dataset.tab));
   on("compare-toggle", "click", () => {
@@ -2843,6 +3024,13 @@ function wireEvents() {
         else undoCurrentPhoto();
         return;
       }
+    }
+    const cullingAction = photoCullingShortcutAction(event, Boolean(document.querySelector("dialog[open]")));
+    if (currentPhoto() && cullingAction) {
+      event.preventDefault();
+      if (cullingAction.type === "rating") setCurrentPhotoRating(cullingAction.value);
+      else setCurrentPhotoFlag(cullingAction.value);
+      return;
     }
     if (event.key === "Escape" && whiteBalanceActive) {
       event.preventDefault();

@@ -119,16 +119,53 @@
       </div>
 
       <section class="filmstrip" aria-label="照片胶片带">
-        <div class="film-head"><strong>照片</strong><span id="photo-count">0 张</span></div>
-        <div class="film-items" id="film-items"></div>
-        <button class="film-add" id="film-add" type="button" aria-label="添加照片" title="添加照片"><svg><use href="#i-plus"></use></svg></button>
+        <div class="film-filter-row">
+          <div class="film-head"><strong>照片</strong><span id="photo-count">0 张</span></div>
+          <div class="film-filter-buttons" role="group" aria-label="按旗标筛选照片">
+            <button class="film-filter" id="film-filter-all" type="button" aria-pressed="true">全部</button>
+            <button class="film-filter" id="film-filter-pick" type="button" aria-pressed="false">入选</button>
+            <button class="film-filter" id="film-filter-reject" type="button" aria-pressed="false">剔除</button>
+            <button class="film-filter" id="film-filter-unflagged" type="button" aria-pressed="false">未标记</button>
+          </div>
+          <label class="film-rating-filter" for="film-min-rating"><span>最低星级</span>
+            <select id="film-min-rating" aria-label="按最低星级筛选照片">
+              <option value="0">不限</option><option value="1">1 星起</option><option value="2">2 星起</option>
+              <option value="3">3 星起</option><option value="4">4 星起</option><option value="5">5 星</option>
+            </select>
+          </label>
+          <button class="film-add" id="film-add" type="button" aria-label="添加照片" title="添加照片"><svg><use href="#i-plus"></use></svg></button>
+        </div>
+        <div class="film-items" id="film-items" aria-label="当前筛选的照片"></div>
       </section>
     </section>
 
     <aside class="inspector" aria-label="照片调整与项目">
       <div class="inspector-heading">
-        <div><h2 id="inspector-title">调色</h2><p id="inspector-caption">先调整原片，再应用风格，最后微调成片。</p></div>
-        <button class="icon-button" id="reset-photo" type="button" title="重置当前照片" aria-label="重置当前照片" disabled><svg><use href="#i-reset"></use></svg></button>
+        <div class="inspector-title-row">
+          <div><h2 id="inspector-title">调色</h2><p id="inspector-caption">先调整原片，再应用风格，最后微调成片。</p></div>
+          <button class="icon-button" id="reset-photo" type="button" title="重置当前照片" aria-label="重置当前照片" disabled><svg><use href="#i-reset"></use></svg></button>
+        </div>
+        <div class="photo-culling-controls">
+          <div class="rating-row">
+            <span class="culling-label">星级</span>
+            <div class="rating-stars" role="group" aria-label="设置当前照片星级">
+              <button class="rating-star" id="photo-rating-1" type="button" data-rating="1" aria-label="设为 1 星" aria-keyshortcuts="1" aria-pressed="false" disabled><svg><use href="#i-star"></use></svg></button>
+              <button class="rating-star" id="photo-rating-2" type="button" data-rating="2" aria-label="设为 2 星" aria-keyshortcuts="2" aria-pressed="false" disabled><svg><use href="#i-star"></use></svg></button>
+              <button class="rating-star" id="photo-rating-3" type="button" data-rating="3" aria-label="设为 3 星" aria-keyshortcuts="3" aria-pressed="false" disabled><svg><use href="#i-star"></use></svg></button>
+              <button class="rating-star" id="photo-rating-4" type="button" data-rating="4" aria-label="设为 4 星" aria-keyshortcuts="4" aria-pressed="false" disabled><svg><use href="#i-star"></use></svg></button>
+              <button class="rating-star" id="photo-rating-5" type="button" data-rating="5" aria-label="设为 5 星" aria-keyshortcuts="5" aria-pressed="false" disabled><svg><use href="#i-star"></use></svg></button>
+            </div>
+            <button class="rating-clear" id="photo-rating-clear" type="button" aria-label="清除当前照片星级" title="清除星级（快捷键 0）" aria-keyshortcuts="0" aria-pressed="true" disabled>清除</button>
+          </div>
+          <div class="flag-row">
+            <span class="culling-label">旗标</span>
+            <div class="photo-flag-actions" role="group" aria-label="设置当前照片旗标">
+              <button class="flag-action" id="photo-flag-pick" type="button" aria-label="标记为入选" title="标记为入选（快捷键 P）" aria-keyshortcuts="P" aria-pressed="false" disabled>入选</button>
+              <button class="flag-action" id="photo-flag-reject" type="button" aria-label="标记为剔除" title="标记为剔除（快捷键 X）" aria-keyshortcuts="X" aria-pressed="false" disabled>剔除</button>
+              <button class="flag-action" id="photo-flag-clear" type="button" aria-label="清除当前照片旗标" title="清除旗标（快捷键 U）" aria-keyshortcuts="U" aria-pressed="true" disabled>清除</button>
+            </div>
+          </div>
+        </div>
       </div>
       <div class="inspector-scroll">
         <section id="panel-landscape" class="tool-panel" aria-labelledby="inspector-title"></section>
