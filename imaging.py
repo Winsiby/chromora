@@ -171,6 +171,117 @@ def _apply_masks(rgb, masks):
             np.clip(pixels, 0, 1, out=pixels)
 
 
+ASPECT_PRESETS = frozenset(("free", "original", "1:1", "4:5", "3:2", "16:9"))
+DEFAULT_COMPOSITION = {"crop": None, "aspect": "free", "rotation": 0, "straighten": 0}
+
+
+def validate_composition(value):
+    """Validate a non-destructive crop/rotation/straighten state."""
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise ValueError("构图参数格式无效")
+    crop = value.get("crop")
+    if crop is None:
+        normalized_crop = None
+    else:
+        if not isinstance(crop, dict):
+            raise ValueError("裁剪框格式无效")
+        x = _unit_value(crop.get("x"), "裁剪框左侧")
+        y = _unit_value(crop.get("y"), "裁剪框上侧")
+        width = _unit_value(crop.get("width"), "裁剪框宽度")
+        height = _unit_value(crop.get("height"), "裁剪框高度")
+        if width <= 0 or height <= 0 or x + width > 1 + 1e-9 or y + height > 1 + 1e-9:
+            raise ValueError("裁剪框必须位于图像范围内且面积大于零")
+        normalized_crop = {"x": x, "y": y, "width": width, "height": height}
+
+    aspect = value.get("aspect", "free")
+    if not isinstance(aspect, str) or aspect not in ASPECT_PRESETS:
+        raise ValueError("裁剪比例无效")
+    rotation = value.get("rotation", 0)
+    if type(rotation) is not int or rotation not in (0, 90, 180, 270):
+        raise ValueError("旋转角度必须是 0、90、180 或 270 度")
+    straighten = value.get("straighten", 0)
+    if type(straighten) not in (int, float) or not math.isfinite(straighten) or not -15 <= straighten <= 15:
+        raise ValueError("拉直角度必须在 -15 到 15 度之间")
+    return {
+        "crop": normalized_crop,
+        "aspect": aspect,
+        "rotation": rotation,
+        "straighten": float(straighten),
+    }
+
+
+def _largest_inscribed_size(width, height, clockwise_degrees):
+    """Largest centered crop with the input aspect ratio after rotation."""
+    angle = math.radians(abs(clockwise_degrees))
+    cosine, sine = math.cos(angle), math.sin(angle)
+    aspect = width / height
+    maximum_height = min(
+        width / (aspect * cosine + sine),
+        height / (aspect * sine + cosine),
+    )
+    # Keep a two-pixel safety margin for bicubic interpolation at every edge.
+    output_height = max(1, math.floor(maximum_height) - 4)
+    output_width = max(1, min(width, round(output_height * aspect)))
+    return output_width, output_height
+
+
+def _rotate_float(rgb, clockwise_degrees):
+    rotated = np.empty_like(rgb)
+    for channel in range(3):
+        plane = Image.fromarray(np.asarray(rgb[:, :, channel], dtype=np.float32)).rotate(
+            -clockwise_degrees,
+            resample=Image.Resampling.BICUBIC,
+            expand=False,
+            fillcolor=0.0,
+        )
+        rotated[:, :, channel] = np.asarray(plane, dtype=np.float32)
+    return rotated
+
+
+def _resize_float(rgb, width, height):
+    if rgb.shape[1] == width and rgb.shape[0] == height:
+        return rgb
+    resized = np.empty((height, width, 3), dtype=np.float32)
+    for channel in range(3):
+        plane = Image.fromarray(np.asarray(rgb[:, :, channel], dtype=np.float32))
+        resized[:, :, channel] = np.asarray(
+            plane.resize((width, height), Image.Resampling.LANCZOS),
+            dtype=np.float32,
+        )
+    return resized
+
+
+def _apply_composition(rgb, composition):
+    channel_min = rgb.min(axis=(0, 1), keepdims=True)
+    channel_max = rgb.max(axis=(0, 1), keepdims=True)
+    rotation = composition["rotation"]
+    if rotation:
+        rgb = np.rot90(rgb, k=-(rotation // 90)).copy()
+
+    crop = composition["crop"]
+    if crop is not None:
+        height, width = rgb.shape[:2]
+        left = min(width - 1, max(0, math.floor(crop["x"] * width)))
+        top = min(height - 1, max(0, math.floor(crop["y"] * height)))
+        right = min(width, max(left + 1, math.ceil((crop["x"] + crop["width"]) * width)))
+        bottom = min(height, max(top + 1, math.ceil((crop["y"] + crop["height"]) * height)))
+        rgb = rgb[top:bottom, left:right].copy()
+
+    angle = composition["straighten"]
+    if abs(angle) > 1e-6:
+        height, width = rgb.shape[:2]
+        inner_width, inner_height = _largest_inscribed_size(width, height, angle)
+        rgb = _rotate_float(rgb, angle)
+        left = (width - inner_width) // 2
+        top = (height - inner_height) // 2
+        rgb = rgb[top:top + inner_height, left:left + inner_width]
+        rgb = _resize_float(rgb, width, height)
+
+    return np.clip(rgb, channel_min, channel_max, out=rgb)
+
+
 @lru_cache(maxsize=4)
 def _read_cube(path, modified, byte_count):
     size = 0
@@ -472,6 +583,7 @@ def _retouch(rgb, settings):
 
 
 def render(path: Path, settings: dict, lut: Path | None, format: str, preview: bool = False) -> bytes:
+    composition = validate_composition(settings.get("composition"))
     masks = validate_masks(settings.get("masks", []))
     if preview:
         info = path.stat()
@@ -496,6 +608,7 @@ def render(path: Path, settings: dict, lut: Path | None, format: str, preview: b
     }
     if any(finishing.values()):
         _adjust(rgb, finishing)
+    rgb = _apply_composition(rgb, composition)
 
     target = BytesIO()
     if format in ("tif", "tiff"):

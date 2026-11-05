@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT / "vendor"))
 
 from PIL import Image, ImageCms
 from engine_adapters import capabilities, decode_raw, open_in_patchy
-from imaging import render, validate_lut, validate_masks
+from imaging import render, validate_composition, validate_lut, validate_masks
 
 DATA = ROOT / "数据"
 PHOTOS = DATA / "原片"
@@ -87,6 +87,7 @@ def validate_project_state(state: dict, *, check_originals: bool = False) -> Non
         settings = photo.get("settings", {})
         if not isinstance(settings, dict):
             raise ValueError(f"工程中的第 {index + 1} 张照片调整参数无效。")
+        validate_composition(settings.get("composition"))
         validate_masks(settings.get("masks", []))
 
 
@@ -131,7 +132,8 @@ def make_psd(source: Path, settings: dict, lut: Path | None) -> bytes:
     from psd_tools.constants import Resource
     from psd_tools.psd.image_resources import ImageResource
 
-    with Image.open(io.BytesIO(render(source, {}, None, "png"))) as image:
+    original_settings = {"composition": settings.get("composition")}
+    with Image.open(io.BytesIO(render(source, original_settings, None, "png"))) as image:
         original = image.convert("RGB")
     with Image.open(io.BytesIO(render(source, settings, lut, "png"))) as image:
         edited = image.convert("RGB")
