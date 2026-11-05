@@ -8,6 +8,7 @@ const tabs = {
   landscape: ["调色", "先调整原片，再应用风格，最后微调成片。"],
   portrait: ["人像调整", "把肤色与纹理调整限制在指定区域。"],
   masks: ["局部调整", "添加渐变或径向蒙版，只影响选定区域。"],
+  composition: ["构图", "裁剪、旋转照片，并细调水平。"],
   styles: ["风格与配方", "选好风格后，可以继续微调成片。"],
   project: ["项目", "保存工作状态，或在 Patchy 中继续精修。"]
 };
@@ -100,7 +101,26 @@ let fullRenderTimer;
 let previewController;
 let originalUrl;
 let editedUrl;
+let comparisonOriginalUrl;
+let comparisonCompositionKey;
+let sourceImageSize = { width: 0, height: 0 };
+let compositionBaseUrl;
+let compositionBaseImage;
+let compositionBaseId;
+let compositionController;
+let compositionLoadSequence = 0;
+let compositionGesture = null;
 let loadingFiles = false;
+let whiteBalanceActive = false;
+let whiteBalanceBusy = false;
+let whiteBalanceController;
+let whiteBalanceSequence = 0;
+// Viewing aids intentionally live outside photos/settings and project/export payloads.
+let clippingEnabled = false;
+let compositionPaintSequence = 0;
+const clippingMasks = new WeakMap();
+
+const compositionDefaults = { crop: null, aspect: "free", rotation: 0, straighten: 0 };
 
 function loadPreferences(saved) {
   return {
@@ -121,6 +141,77 @@ function savePreferences() {
 
 function currentPhoto() {
   return photos.find((photo) => photo.id === currentId);
+}
+
+function photoComposition(photo = currentPhoto()) {
+  return { ...compositionDefaults, ...(photo?.settings?.composition || {}) };
+}
+
+function ensureComposition(photo = currentPhoto()) {
+  if (!photo) return null;
+  if (!photo.settings.composition) photo.settings.composition = { ...compositionDefaults };
+  return photo.settings.composition;
+}
+
+function sourceDimensions() {
+  return { ...sourceImageSize };
+}
+
+function rotatedDimensions(composition = photoComposition()) {
+  const { width, height } = sourceDimensions();
+  return composition.rotation % 180 === 90
+    ? { width: height, height: width }
+    : { width, height };
+}
+
+function namedAspectRatio(value, composition = photoComposition()) {
+  if (value === "original") {
+    const { width, height } = rotatedDimensions(composition);
+    return width && height ? width / height : 1;
+  }
+  if (value === "free") return null;
+  const [width, height] = String(value).split(":").map(Number);
+  return width > 0 && height > 0 ? width / height : null;
+}
+
+function centeredCropForAspect(value, composition = photoComposition()) {
+  if (value === "original") return { x: 0, y: 0, width: 1, height: 1 };
+  const target = namedAspectRatio(value, composition);
+  const dimensions = rotatedDimensions(composition);
+  const imageAspect = dimensions.width && dimensions.height ? dimensions.width / dimensions.height : 1;
+  if (!target) return null;
+  let width = 1;
+  let height = 1;
+  if (imageAspect > target) width = target / imageAspect;
+  else height = imageAspect / target;
+  return { x: (1 - width) / 2, y: (1 - height) / 2, width, height };
+}
+
+function cropRect(composition = photoComposition()) {
+  return composition.crop ? { ...composition.crop } : { x: 0, y: 0, width: 1, height: 1 };
+}
+
+function compositionHasEffect(composition) {
+  const crop = composition?.crop;
+  const cropped = crop && (crop.x > 1e-6 || crop.y > 1e-6 || crop.width < 1 - 1e-6 || crop.height < 1 - 1e-6);
+  return Boolean(cropped || composition?.rotation || Math.abs(composition?.straighten || 0) > 1e-6);
+}
+
+function syncCompositionPanel() {
+  const photo = currentPhoto();
+  const composition = photoComposition(photo);
+  for (const button of selectAll("[data-aspect]")) {
+    button.setAttribute("aria-pressed", String(button.dataset.aspect === composition.aspect));
+    button.disabled = !photo;
+  }
+  byId("clear-crop").disabled = !photo || !composition.crop;
+  byId("rotate-left").disabled = !photo;
+  byId("rotate-right").disabled = !photo;
+  byId("rotation-value").textContent = composition.rotation + "°";
+  byId("straighten-range").disabled = !photo;
+  byId("straighten-range").value = composition.straighten;
+  byId("straighten-value").textContent = (composition.straighten > 0 ? "+" : "") + composition.straighten.toFixed(1) + "°";
+  updateCompositionOverlay();
 }
 
 function setStatus(message, tone = "") {
@@ -149,6 +240,100 @@ async function post(url, data, signal) {
 
 function renderPayload(photo) {
   return { id: photo.id, name: photo.name, settings: photo.settings, lutId: photo.lutId };
+}
+
+function whiteBalancePreviewPending() {
+  const chip = byId("render-chip");
+  return !chip.hidden && chip.textContent.startsWith("正在");
+}
+
+function syncWhiteBalanceTool() {
+  const button = byId("white-balance-sample");
+  if (!button) return;
+  const pending = whiteBalancePreviewPending();
+  button.disabled = !currentPhoto() || !originalUrl || byId("view").hidden;
+  // Keep focus on the tool after a successful sample while the new preview renders.
+  button.setAttribute("aria-disabled", String(pending && !whiteBalanceActive));
+  button.setAttribute("aria-pressed", String(whiteBalanceActive));
+  button.setAttribute("aria-busy", String(whiteBalanceBusy));
+  button.title = whiteBalanceActive ? "取消白平衡取样（Esc）"
+    : pending ? "正在更新预览，请稍候" : "从中性灰或白色区域取样";
+  const instruction = byId("white-balance-instruction");
+  instruction.hidden = !whiteBalanceActive;
+  instruction.textContent = whiteBalanceBusy ? "正在取样，Esc 取消。"
+    : pending ? "正在更新预览，Esc 取消。" : "点击中性灰或白色区域，Esc 取消。";
+  byId("photo-stack").classList.toggle("sampling-white-balance", whiteBalanceActive);
+  byId("view").setAttribute("aria-label", whiteBalanceActive
+    ? "照片画布，点击中性灰或白色区域取样白平衡，Escape 取消"
+    : "照片画布，按住空格暂看原图");
+  if (whiteBalanceActive) byId("view").setAttribute("aria-describedby", instruction.id);
+  else byId("view").removeAttribute("aria-describedby");
+}
+
+function setWhiteBalanceMode(active, restoreFocus = false) {
+  whiteBalanceSequence++;
+  whiteBalanceController?.abort();
+  whiteBalanceController = undefined;
+  whiteBalanceBusy = false;
+  whiteBalanceActive = Boolean(active && currentPhoto() && originalUrl && !byId("view").hidden && tab === "landscape" && !whiteBalancePreviewPending());
+  if (whiteBalanceActive) peekingOriginal = false;
+  syncWhiteBalanceTool();
+  updateViewControls();
+  if (whiteBalanceActive) byId("view").focus({ preventScroll: true });
+  else if (restoreFocus) byId("white-balance-sample").focus({ preventScroll: true });
+}
+
+async function sampleWhiteBalance(event) {
+  if (!whiteBalanceActive || event.button !== 0 || event.isPrimary === false) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  if (whiteBalanceBusy) return;
+  if (whiteBalancePreviewPending()) {
+    setStatus("预览正在更新，完成后再点击照片取样。");
+    return;
+  }
+  const photo = currentPhoto();
+  const rect = byId("image-edited").getBoundingClientRect();
+  if (!photo || !rect.width || !rect.height) return;
+  const point = { x: (event.clientX - rect.left) / rect.width, y: (event.clientY - rect.top) / rect.height };
+  if (point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1) return;
+  const source = outputPointToSource(point, photo);
+  if (source.x < -1e-6 || source.x > 1 + 1e-6 || source.y < -1e-6 || source.y > 1 + 1e-6) return;
+  const sequence = ++whiteBalanceSequence;
+  const sourceSequence = photoSequence;
+  const controller = new AbortController();
+  whiteBalanceController = controller;
+  whiteBalanceBusy = true;
+  syncWhiteBalanceTool();
+  setStatus("正在取样白平衡…", "busy");
+  try {
+    const response = await post("/api/white-balance", {
+      id: photo.id, x: Math.max(0, Math.min(1, source.x)), y: Math.max(0, Math.min(1, source.y))
+    }, controller.signal);
+    const result = await response.json();
+    if (sequence !== whiteBalanceSequence || sourceSequence !== photoSequence || currentId !== photo.id) return;
+    if (![result.temperature, result.tint].every((value) => Number.isInteger(value) && value >= -100 && value <= 100)) {
+      throw new Error("取样返回的白平衡数值无效，请重试。");
+    }
+    // The endpoint returns absolute slider values, never deltas.
+    photo.settings.temperature = result.temperature;
+    photo.settings.tint = result.tint;
+    dirty = true;
+    setWhiteBalanceMode(false, true);
+    syncControls();
+    schedulePreview();
+    setStatus("已取样白平衡，可继续用色温和色调滑杆微调。");
+  } catch (error) {
+    if (error.name !== "AbortError" && sequence === whiteBalanceSequence && sourceSequence === photoSequence) {
+      setStatus("白平衡取样失败：" + error.message, "error");
+    }
+  } finally {
+    if (sequence === whiteBalanceSequence) {
+      whiteBalanceBusy = false;
+      whiteBalanceController = undefined;
+      syncWhiteBalanceTool();
+    }
+  }
 }
 
 function controlGroup(container, title, keys, suffix) {
@@ -200,6 +385,7 @@ function controlGroup(container, title, keys, suffix) {
 function setControl(key, value) {
   const photo = currentPhoto();
   if (!photo) return;
+  if (whiteBalanceBusy && (key === "temperature" || key === "tint")) setWhiteBalanceMode(false);
   const [, min, max, step] = controls[key];
   const rounded = Number((Math.round(value / step) * step).toFixed(2));
   photo.settings[key] = Math.max(min, Math.min(max, rounded));
@@ -235,6 +421,8 @@ function syncControls() {
   byId("export-open").disabled = !photo;
   if (byId("curve-section").open) drawCurve();
   syncMaskPanel();
+  syncCompositionPanel();
+  syncWhiteBalanceTool();
   updateViewControls();
 }
 
@@ -719,6 +907,69 @@ function maskHandle(group, mask, name, x, y, label) {
   group.append(circle);
 }
 
+function sourcePointToOutput(point, photo = currentPhoto()) {
+  const composition = photoComposition(photo);
+  const rotated = rotatedDimensions(composition);
+  let x = point.x;
+  let y = point.y;
+  if (composition.rotation === 90) [x, y] = [1 - y, x];
+  else if (composition.rotation === 180) [x, y] = [1 - x, 1 - y];
+  else if (composition.rotation === 270) [x, y] = [y, 1 - x];
+  const crop = cropRect(composition);
+  const cropX = (x - crop.x) / Math.max(crop.width, 1e-8);
+  const cropY = (y - crop.y) / Math.max(crop.height, 1e-8);
+  const fullCrop = actualZoom && fullOriginal?.compositionKey === JSON.stringify(composition) ? fullOriginal : null;
+  const cropPixelWidth = fullCrop?.width || Math.max(1, rotated.width * crop.width);
+  const cropPixelHeight = fullCrop?.height || Math.max(1, rotated.height * crop.height);
+  const localX = (cropX - 0.5) * cropPixelWidth;
+  const localY = (cropY - 0.5) * cropPixelHeight;
+  const angle = (composition.straighten || 0) * Math.PI / 180;
+  if (Math.abs(angle) < 1e-6) return { x: cropX, y: cropY };
+  const aspect = cropPixelWidth / cropPixelHeight;
+  const cosine = Math.cos(Math.abs(angle));
+  const sine = Math.sin(Math.abs(angle));
+  const innerHeight = Math.max(1, Math.floor(Math.min(
+    cropPixelWidth / (aspect * cosine + sine),
+    cropPixelHeight / (aspect * sine + cosine)
+  )) - 4);
+  const innerWidth = Math.max(1, Math.min(cropPixelWidth, Math.round(innerHeight * aspect)));
+  const turnedX = Math.cos(angle) * localX - Math.sin(angle) * localY;
+  const turnedY = Math.sin(angle) * localX + Math.cos(angle) * localY;
+  return {
+    x: 0.5 + turnedX / innerWidth,
+    y: 0.5 + turnedY / innerHeight
+  };
+}
+
+function outputPointToSource(point, photo = currentPhoto()) {
+  const origin = sourcePointToOutput({ x: 0, y: 0 }, photo);
+  const across = sourcePointToOutput({ x: 1, y: 0 }, photo);
+  const down = sourcePointToOutput({ x: 0, y: 1 }, photo);
+  const a = across.x - origin.x;
+  const b = across.y - origin.y;
+  const c = down.x - origin.x;
+  const d = down.y - origin.y;
+  const determinant = a * d - b * c;
+  if (Math.abs(determinant) < 1e-10) return point;
+  const x = point.x - origin.x;
+  const y = point.y - origin.y;
+  return { x: (d * x - c * y) / determinant, y: (-b * x + a * y) / determinant };
+}
+
+function sourceToOutputMatrix(photo = currentPhoto()) {
+  const origin = sourcePointToOutput({ x: 0, y: 0 }, photo);
+  const across = sourcePointToOutput({ x: 1, y: 0 }, photo);
+  const down = sourcePointToOutput({ x: 0, y: 1 }, photo);
+  return [
+    across.x - origin.x,
+    across.y - origin.y,
+    down.x - origin.x,
+    down.y - origin.y,
+    origin.x * 1000,
+    origin.y * 1000
+  ];
+}
+
 function updateMaskOverlay() {
   const overlay = byId("mask-overlay");
   if (!overlay) return;
@@ -734,7 +985,8 @@ function updateMaskOverlay() {
   for (const [index, mask] of currentMasks(photo).entries()) {
     const selected = mask.id === selectedMaskId;
     const color = mask.enabled ? "#dfb588" : "#87919c";
-    const group = svgElement("g", { class: "mask-shape" + (selected ? " is-selected" : ""), "data-mask-select": mask.id, opacity: mask.enabled ? 1 : 0.55 });
+    const matrix = sourceToOutputMatrix(photo).join(" ");
+    const group = svgElement("g", { class: "mask-shape" + (selected ? " is-selected" : ""), "data-mask-select": mask.id, opacity: mask.enabled ? 1 : 0.55, transform: "matrix(" + matrix + ")" });
     if (mask.type === "linear") {
       const gradientId = "mask-gradient-" + index;
       const gradient = svgElement("linearGradient", {
@@ -806,7 +1058,9 @@ function updateMaskOverlay() {
 function maskPoint(event) {
   const bounds = byId("mask-overlay").getBoundingClientRect();
   const limit = (value) => Math.max(0, Math.min(1, value));
-  return { x: limit((event.clientX - bounds.left) / bounds.width), y: limit((event.clientY - bounds.top) / bounds.height) };
+  const outputPoint = { x: limit((event.clientX - bounds.left) / bounds.width), y: limit((event.clientY - bounds.top) / bounds.height) };
+  const sourcePoint = outputPointToSource(outputPoint);
+  return { x: limit(sourcePoint.x), y: limit(sourcePoint.y) };
 }
 
 function moveMaskHandle(mask, handle, point) {
@@ -847,7 +1101,22 @@ function preparePanels() {
   histogram.className = "histogram";
   histogram.innerHTML = '<span>RGB 直方图</span><canvas id="histogram" width="270" height="77" aria-label="当前效果的 RGB 直方图"></canvas>';
   landscape.append(histogram);
-  controlGroup(editorSection(landscape, "base-section", "基础调色", true), "", baseKeys);
+  const base = editorSection(landscape, "base-section", "基础调色", true);
+  const whiteBalanceTools = document.createElement("div");
+  whiteBalanceTools.className = "white-balance-tools";
+  whiteBalanceTools.innerHTML = '<span>白平衡</span><button type="button" class="button small outline" id="white-balance-sample" aria-pressed="false" aria-describedby="white-balance-instruction" disabled>取样白平衡</button>';
+  const whiteBalanceInstruction = document.createElement("p");
+  whiteBalanceInstruction.id = "white-balance-instruction";
+  whiteBalanceInstruction.className = "white-balance-instruction";
+  whiteBalanceInstruction.hidden = true;
+  base.append(whiteBalanceTools, whiteBalanceInstruction);
+  controlGroup(base, "", baseKeys);
+  byId("white-balance-sample").addEventListener("click", () => {
+    if (whiteBalancePreviewPending() && !whiteBalanceActive) return;
+    const active = !whiteBalanceActive;
+    setWhiteBalanceMode(active, !active);
+    setStatus(active ? "白平衡取样已开启：点击照片中的中性灰或白色区域。" : "已取消白平衡取样。");
+  });
   prepareCurve(editorSection(landscape, "curve-section", "曲线"));
   bandControls(editorSection(landscape, "mixer-section", "色彩混合"), "hsl", hslBands, hslAdjustments);
   const grading = editorSection(landscape, "grade-section", "色彩分级");
@@ -880,13 +1149,37 @@ function preparePanels() {
     schedulePreview();
   });
   prepareMaskPanel();
+  prepareCompositionPanel();
   controlGroup(byId("style-sliders"), "应用强度", ["lutStrength"]);
   controlGroup(byId("style-sliders"), "成片微调", postKeys, "-styles");
 }
 
+function prepareCompositionPanel() {
+  for (const button of selectAll("[data-aspect]")) {
+    button.addEventListener("click", () => chooseAspect(button.dataset.aspect));
+  }
+  byId("clear-crop").addEventListener("click", () => {
+    changeComposition((composition) => {
+      composition.crop = null;
+      composition.aspect = "free";
+    });
+    setStatus("已清除裁剪，保留旋转和拉直");
+  });
+  byId("rotate-left").addEventListener("click", () => rotateComposition(-90));
+  byId("rotate-right").addEventListener("click", () => rotateComposition(90));
+  byId("straighten-range").addEventListener("input", (event) => {
+    const value = Math.max(-15, Math.min(15, Math.round(event.currentTarget.valueAsNumber * 10) / 10));
+    changeComposition((composition) => { composition.straighten = value; });
+  });
+}
+
 function selectTab(next) {
   if (!tabs[next]) return;
+  if (next !== "landscape" && whiteBalanceActive) setWhiteBalanceMode(false);
   if (editingRegion) finishRegion(false);
+  if (next !== "composition") {
+    discardCompositionBase();
+  }
   if (next !== "masks") {
     maskDrawType = null;
     maskGesture = null;
@@ -903,6 +1196,14 @@ function selectTab(next) {
   }
   updateRegionOverlay();
   syncMaskPanel();
+  syncCompositionPanel();
+  updateViewControls();
+  if (next === "composition" && currentPhoto()) {
+    fitCompositionStage();
+    loadCompositionBase(currentPhoto());
+  } else if (next !== "composition" && !byId("view").hidden) {
+    fitImage();
+  }
   if (next === "project" && capability) loadProjectList();
   if (next === "landscape") drawHistogram();
 }
@@ -995,26 +1296,37 @@ function setSplit(value) {
 
 function updateViewControls() {
   const ready = Boolean(currentPhoto() && originalUrl);
-  const peek = ready && peekingOriginal && !editingRegion;
-  byId("compare-toggle").disabled = !ready;
+  const composing = tab === "composition";
+  const peek = ready && peekingOriginal && !editingRegion && !composing && !whiteBalanceActive;
+  byId("compare-toggle").disabled = !ready || composing || whiteBalanceActive;
   byId("compare-toggle").setAttribute("aria-pressed", String(comparing));
-  byId("compare-ui").hidden = !comparing || editingRegion || peek;
+  byId("compare-ui").hidden = !comparing || editingRegion || peek || composing || whiteBalanceActive;
   const stack = byId("photo-stack");
-  stack.classList.toggle("solo", !comparing || editingRegion);
+  stack.classList.toggle("solo", !comparing || editingRegion || composing || whiteBalanceActive);
   stack.classList.toggle("peek-original", peek);
+  stack.classList.toggle("composing", composing);
+  byId("composition-canvas").hidden = !composing;
   byId("peek-label").hidden = !peek;
-  byId("zoom-in").disabled = !ready || (!actualZoom && zoom >= 4);
-  byId("zoom-out").disabled = !ready || (!actualZoom && zoom <= 1);
-  byId("zoom-fit").disabled = !ready || (!actualZoom && zoom === 1);
-  byId("zoom-actual").disabled = !ready;
+  byId("zoom-in").disabled = !ready || composing || (!actualZoom && zoom >= 4);
+  byId("zoom-out").disabled = !ready || composing || (!actualZoom && zoom <= 1);
+  byId("zoom-fit").disabled = !ready || composing || (!actualZoom && zoom === 1);
+  byId("zoom-actual").disabled = !ready || composing;
   byId("zoom-actual").setAttribute("aria-pressed", String(actualZoom));
   byId("zoom-label").textContent = actualZoom && fullOriginal
     ? "实际像素"
     : (zoom === 1 ? "适合窗口" : "适合 ×" + Math.round(zoom * 100) / 100);
   updateMaskOverlay();
+  updateCompositionOverlay();
+  if (composing) fitCompositionStage();
+  syncWhiteBalanceTool();
+  updateClippingOverlay();
 }
 
 function fitImage() {
+  if (tab === "composition") {
+    fitCompositionStage();
+    return;
+  }
   const view = byId("view");
   const stack = byId("photo-stack");
   const actual = actualZoom && fullOriginal;
@@ -1036,18 +1348,316 @@ function fitImage() {
   updateViewControls();
 }
 
+function compositionGeometry(composition = photoComposition()) {
+  const dimensions = compositionBaseImage
+    ? { width: compositionBaseImage.naturalWidth, height: compositionBaseImage.naturalHeight }
+    : sourceDimensions();
+  const rotatedWidth = composition.rotation % 180 === 90 ? dimensions.height : dimensions.width;
+  const rotatedHeight = composition.rotation % 180 === 90 ? dimensions.width : dimensions.height;
+  const angle = (composition.straighten || 0) * Math.PI / 180;
+  const cosine = Math.abs(Math.cos(angle));
+  const sine = Math.abs(Math.sin(angle));
+  return {
+    ...dimensions,
+    rotatedWidth,
+    rotatedHeight,
+    boundsWidth: cosine * rotatedWidth + sine * rotatedHeight,
+    boundsHeight: sine * rotatedWidth + cosine * rotatedHeight,
+    angle
+  };
+}
+
+function fitCompositionStage() {
+  if (tab !== "composition" || !currentPhoto() || byId("view").hidden) return;
+  const geometry = compositionGeometry();
+  if (!(geometry.boundsWidth > 0 && geometry.boundsHeight > 0)) return;
+  const canvas = byId("canvas");
+  const maxWidth = Math.max(1, canvas.clientWidth - 30);
+  const maxHeight = Math.max(1, canvas.clientHeight - 30);
+  const scale = Math.min(maxWidth / geometry.boundsWidth, maxHeight / geometry.boundsHeight);
+  const stack = byId("photo-stack");
+  stack.style.width = (geometry.boundsWidth * scale) + "px";
+  stack.style.height = (geometry.boundsHeight * scale) + "px";
+  drawCompositionImage();
+  updateCompositionOverlay();
+}
+
+function drawCompositionImage() {
+  const canvas = byId("composition-canvas");
+  const context = canvas.getContext("2d");
+  const rect = byId("photo-stack").getBoundingClientRect();
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(1, rect.width);
+  const height = Math.max(1, rect.height);
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  canvas.style.width = width + "px";
+  canvas.style.height = height + "px";
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  context.clearRect(0, 0, width, height);
+  compositionPaintSequence++;
+  if (!compositionBaseImage?.naturalWidth) return;
+  const composition = photoComposition();
+  const geometry = compositionGeometry(composition);
+  const scale = Math.min(width / geometry.boundsWidth, height / geometry.boundsHeight);
+  context.translate(width / 2, height / 2);
+  context.scale(scale, scale);
+  context.rotate((composition.rotation + composition.straighten) * Math.PI / 180);
+  context.drawImage(compositionBaseImage, -geometry.width / 2, -geometry.height / 2, geometry.width, geometry.height);
+  updateClippingOverlay();
+}
+
+function cropPointToScreen(point, composition = photoComposition()) {
+  const geometry = compositionGeometry(composition);
+  const x = (point.x - 0.5) * geometry.rotatedWidth;
+  const y = (point.y - 0.5) * geometry.rotatedHeight;
+  const cosine = Math.cos(geometry.angle);
+  const sine = Math.sin(geometry.angle);
+  return {
+    x: 0.5 + (cosine * x - sine * y) / geometry.boundsWidth,
+    y: 0.5 + (sine * x + cosine * y) / geometry.boundsHeight
+  };
+}
+
+function screenPointToCrop(point, composition = photoComposition()) {
+  const geometry = compositionGeometry(composition);
+  const x = (point.x - 0.5) * geometry.boundsWidth;
+  const y = (point.y - 0.5) * geometry.boundsHeight;
+  const cosine = Math.cos(geometry.angle);
+  const sine = Math.sin(geometry.angle);
+  return {
+    x: 0.5 + (cosine * x + sine * y) / geometry.rotatedWidth,
+    y: 0.5 + (-sine * x + cosine * y) / geometry.rotatedHeight
+  };
+}
+
+function cropPathPoints(crop, composition = photoComposition()) {
+  return [
+    { x: crop.x, y: crop.y },
+    { x: crop.x + crop.width, y: crop.y },
+    { x: crop.x + crop.width, y: crop.y + crop.height },
+    { x: crop.x, y: crop.y + crop.height }
+  ].map((point) => cropPointToScreen(point, composition));
+}
+
+function updateCompositionOverlay() {
+  const overlay = byId("composition-overlay");
+  if (!overlay) return;
+  const photo = currentPhoto();
+  overlay.hidden = tab !== "composition" || !photo || byId("view").hidden;
+  overlay.classList.toggle("is-active", !overlay.hidden);
+  overlay.replaceChildren();
+  if (overlay.hidden) return;
+  const composition = photoComposition(photo);
+  const crop = cropRect(composition);
+  const points = cropPathPoints(crop, composition);
+  const pointString = points.map((point) => (point.x * 1000) + "," + (point.y * 1000)).join(" ");
+  const defs = svgElement("defs");
+  const clip = svgElement("clipPath", { id: "crop-guide-clip", clipPathUnits: "userSpaceOnUse" });
+  clip.append(svgElement("polygon", { points: pointString }));
+  defs.append(clip);
+  overlay.append(defs);
+  const outside = svgElement("path", {
+    d: "M0 0H1000V1000H0Z M" + pointString.replace(/ /g, "L") + "Z",
+    "fill-rule": "evenodd", fill: "#05080c", "fill-opacity": "0.62", "pointer-events": "none"
+  });
+  overlay.append(outside);
+  for (const fraction of [1 / 3, 2 / 3]) {
+    const top = cropPointToScreen({ x: crop.x + crop.width * fraction, y: crop.y }, composition);
+    const bottom = cropPointToScreen({ x: crop.x + crop.width * fraction, y: crop.y + crop.height }, composition);
+    const left = cropPointToScreen({ x: crop.x, y: crop.y + crop.height * fraction }, composition);
+    const right = cropPointToScreen({ x: crop.x + crop.width, y: crop.y + crop.height * fraction }, composition);
+    overlay.append(
+      svgElement("line", { x1: top.x * 1000, y1: top.y * 1000, x2: bottom.x * 1000, y2: bottom.y * 1000, class: "crop-guide", "clip-path": "url(#crop-guide-clip)" }),
+      svgElement("line", { x1: left.x * 1000, y1: left.y * 1000, x2: right.x * 1000, y2: right.y * 1000, class: "crop-guide", "clip-path": "url(#crop-guide-clip)" })
+    );
+  }
+  overlay.append(svgElement("polygon", {
+    points: pointString, class: "crop-boundary", "data-crop-move": "true", fill: "transparent"
+  }));
+  overlay.append(svgElement("polygon", { points: pointString, class: "crop-outline", "pointer-events": "none" }));
+  const names = ["nw", "ne", "se", "sw"];
+  const stage = byId("photo-stack").getBoundingClientRect();
+  const unitX = 1000 / Math.max(1, stage.width);
+  const unitY = 1000 / Math.max(1, stage.height);
+  points.forEach((point, index) => {
+    overlay.append(svgElement("ellipse", {
+      cx: point.x * 1000, cy: point.y * 1000, rx: 18 * unitX, ry: 18 * unitY,
+      class: "crop-handle-hit", "data-crop-handle": names[index], "aria-hidden": "true"
+    }));
+    const handle = svgElement("ellipse", {
+      cx: point.x * 1000, cy: point.y * 1000, rx: 6 * unitX, ry: 6 * unitY,
+      class: "crop-handle", "data-crop-handle": names[index],
+      tabindex: 0, role: "slider", "aria-label": ["左上", "右上", "右下", "左下"][index] + "裁剪角点",
+      "aria-valuemin": 0, "aria-valuemax": 1, "aria-valuenow": Math.round(([1, 2].includes(index) ? crop.x + crop.width : crop.x) * 100) / 100
+    });
+    overlay.append(handle);
+  });
+  updateClippingOverlay();
+}
+
+function compositionPointerPoint(event) {
+  const rect = byId("composition-overlay").getBoundingClientRect();
+  return screenPointToCrop({
+    x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
+    y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height))
+  });
+}
+
+function normalizedAspectForCrop(composition) {
+  const target = namedAspectRatio(composition.aspect, composition);
+  const dimensions = rotatedDimensions(composition);
+  const imageAspect = dimensions.width && dimensions.height ? dimensions.width / dimensions.height : 1;
+  return target ? target / imageAspect : null;
+}
+
+function resizeCropCorner(start, handle, point, composition) {
+  const sx = handle.includes("w") ? 1 : -1;
+  const sy = handle.includes("n") ? 1 : -1;
+  const anchorX = sx > 0 ? start.x + start.width : start.x;
+  const anchorY = sy > 0 ? start.y + start.height : start.y;
+  let width = Math.max(0.02, Math.abs(point.x - anchorX));
+  let height = Math.max(0.02, Math.abs(point.y - anchorY));
+  const aspect = normalizedAspectForCrop(composition);
+  if (aspect) {
+    const widthChange = Math.abs(width - start.width) / Math.max(start.width, 1e-8);
+    const heightChange = Math.abs(height - start.height) / Math.max(start.height, 1e-8);
+    if (widthChange >= heightChange) height = width / aspect;
+    else width = height * aspect;
+  }
+  let maxWidth = sx > 0 ? anchorX : 1 - anchorX;
+  let maxHeight = sy > 0 ? anchorY : 1 - anchorY;
+  if (aspect) {
+    maxWidth = Math.min(maxWidth, maxHeight * aspect);
+    maxHeight = Math.min(maxHeight, maxWidth / aspect);
+  }
+  width = Math.min(width, maxWidth);
+  height = Math.min(height, maxHeight);
+  if (aspect) {
+    if (width / Math.max(height, 1e-8) > aspect) width = height * aspect;
+    else height = width / aspect;
+  }
+  return {
+    x: sx > 0 ? anchorX - width : anchorX,
+    y: sy > 0 ? anchorY - height : anchorY,
+    width,
+    height
+  };
+}
+
+function updateCompositionGesture(event) {
+  if (!compositionGesture || compositionGesture.pointerId !== event.pointerId) return;
+  const photo = currentPhoto();
+  if (!photo) return;
+  const point = compositionPointerPoint(event);
+  const composition = ensureComposition(photo);
+  const start = compositionGesture.startCrop;
+  if (compositionGesture.kind === "move") {
+    const dx = point.x - compositionGesture.startPoint.x;
+    const dy = point.y - compositionGesture.startPoint.y;
+    composition.crop = {
+      ...start,
+      x: Math.max(0, Math.min(1 - start.width, start.x + dx)),
+      y: Math.max(0, Math.min(1 - start.height, start.y + dy))
+    };
+  } else {
+    composition.crop = resizeCropCorner(start, compositionGesture.handle, point, composition);
+  }
+  dirty = true;
+  updateCompositionOverlay();
+}
+
+function changeComposition(mutator, preview = true) {
+  const photo = currentPhoto();
+  if (!photo) return;
+  mutator(ensureComposition(photo));
+  actualZoom = false;
+  zoom = 1;
+  byId("view").classList.remove("actual-size", "scrollable");
+  dirty = true;
+  syncCompositionPanel();
+  if (tab === "composition") {
+    fitCompositionStage();
+    drawCompositionImage();
+  }
+  if (preview) schedulePreview();
+}
+
+function chooseAspect(value) {
+  changeComposition((composition) => {
+    composition.aspect = value;
+    if (value !== "free") composition.crop = centeredCropForAspect(value, composition);
+  });
+  setStatus(value === "free" ? "已切换为自由裁剪" : "已应用 " + (value === "original" ? "原比例" : value) + " 构图");
+}
+
+function rotateComposition(direction) {
+  changeComposition((composition) => {
+    composition.rotation = (composition.rotation + direction + 360) % 360;
+  });
+  setStatus("已旋转照片 " + (direction > 0 ? "90°" : "-90°"));
+}
+
+function loadCompositionBase(photo) {
+  if (!photo || !originalUrl || tab !== "composition") return;
+  if (compositionBaseImage && compositionBaseId === photo.id) {
+    fitCompositionStage();
+    return;
+  }
+  compositionController?.abort();
+  const controller = new AbortController();
+  compositionController = controller;
+  const loadSequence = ++compositionLoadSequence;
+  const settings = {
+    ...photo.settings,
+    composition: { crop: null, aspect: "free", rotation: 0, straighten: 0 }
+  };
+  renderBlob(photo, settings, photo.lutId, controller.signal).then(async (blob) => {
+    const url = URL.createObjectURL(blob);
+    const image = new Image();
+    image.src = url;
+    await waitForImage(image);
+    if (loadSequence !== compositionLoadSequence || currentId !== photo.id || tab !== "composition") {
+      URL.revokeObjectURL(url);
+      return;
+    }
+    if (compositionBaseUrl) URL.revokeObjectURL(compositionBaseUrl);
+    compositionBaseUrl = url;
+    compositionBaseImage = image;
+    compositionBaseId = photo.id;
+    fitCompositionStage();
+    setStatus("构图预览已就绪");
+  }).catch((error) => {
+    if (error.name !== "AbortError" && loadSequence === compositionLoadSequence) {
+      setStatus("无法准备构图预览：" + error.message, "error");
+    }
+  });
+}
+
+function discardCompositionBase() {
+  compositionController?.abort();
+  compositionController = null;
+  compositionLoadSequence++;
+  if (compositionBaseUrl) URL.revokeObjectURL(compositionBaseUrl);
+  compositionBaseUrl = undefined;
+  compositionBaseImage = undefined;
+  compositionBaseId = undefined;
+  compositionGesture = null;
+}
+
 function renderBlob(photo, settings, lutId, signal, resolution = "preview") {
   return post("/api/render", { id: photo.id, settings, lutId, resolution }, signal).then((response) => response.blob());
 }
 
 function hasAdjustments(photo) {
   const hasMaskAdjustments = (photo.settings.masks || []).some((mask) => mask.enabled && Object.values(mask.adjustments || {}).some((value) => Number(value) !== 0));
-  return hasMaskAdjustments || Boolean(photo.lutId) || Boolean(Object.keys(photo.settings.curves || {}).length) || Object.entries(defaults).some(([key, value]) => key !== "lutStrength" && key !== "masks" && (photo.settings[key] ?? value) !== value);
+  return hasMaskAdjustments || compositionHasEffect(photoComposition(photo)) || Boolean(photo.lutId) || Boolean(Object.keys(photo.settings.curves || {}).length) || Object.entries(defaults).some(([key, value]) => key !== "lutStrength" && key !== "masks" && (photo.settings[key] ?? value) !== value);
 }
 
 function renderStatus(label) {
   byId("render-chip").textContent = label;
   byId("render-chip").hidden = !label;
+  syncWhiteBalanceTool();
 }
 
 function updateZoom(next, actual = false) {
@@ -1055,7 +1665,7 @@ function updateZoom(next, actual = false) {
   const changingQuality = actual !== actualZoom;
   actualZoom = actual;
   zoom = next;
-  if (!actual) byId("image-original").src = originalUrl;
+  if (!actual) byId("image-original").src = comparisonOriginalUrl || originalUrl;
   fitImage();
   if (changingQuality) schedulePreview();
 }
@@ -1071,9 +1681,11 @@ function waitForImage(image) {
 
 async function selectPhoto(id, force = false) {
   if (id === currentId && originalUrl && !force) return;
+  setWhiteBalanceMode(false);
   clearTimeout(renderTimer);
   clearTimeout(fullRenderTimer);
   previewController?.abort();
+  discardCompositionBase();
   if (editingRegion) finishRegion(false);
   currentId = id;
   selectedMaskId = currentMasks().find((mask) => mask.id === selectedMaskId)?.id || currentMasks()[0]?.id || null;
@@ -1087,10 +1699,14 @@ async function selectPhoto(id, force = false) {
   const sequence = ++photoSequence;
   if (originalUrl) URL.revokeObjectURL(originalUrl);
   if (editedUrl) URL.revokeObjectURL(editedUrl);
+  if (comparisonOriginalUrl) URL.revokeObjectURL(comparisonOriginalUrl);
   if (fullOriginal) URL.revokeObjectURL(fullOriginal.url);
   fullOriginal = undefined;
   originalUrl = undefined;
   editedUrl = undefined;
+  comparisonOriginalUrl = undefined;
+  comparisonCompositionKey = undefined;
+  sourceImageSize = { width: 0, height: 0 };
   byId("view").hidden = true;
   const photo = currentPhoto();
   byId("canvas-name").textContent = photo?.name || "照片预览";
@@ -1123,10 +1739,12 @@ async function selectPhoto(id, force = false) {
     edited.src = originalUrl;
     await waitForImage(original);
     if (sequence !== photoSequence) return;
+    sourceImageSize = { width: original.naturalWidth, height: original.naturalHeight };
     aspect = original.naturalWidth / original.naturalHeight;
     byId("view").hidden = false;
     fitImage();
     drawHistogram();
+    if (tab === "composition") loadCompositionBase(photo);
     if (hasAdjustments(photo)) schedulePreview();
     else renderStatus("预览");
   } catch (error) {
@@ -1141,7 +1759,32 @@ function showEdited(blob, fallbackUrl) {
   const nextUrl = blob ? URL.createObjectURL(blob) : fallbackUrl;
   if (editedUrl) URL.revokeObjectURL(editedUrl);
   editedUrl = blob ? nextUrl : undefined;
+  byId("clipping-overlay").hidden = true;
   byId("image-edited").src = nextUrl;
+}
+
+async function refreshComparisonOriginal(photo, controller, current) {
+  const composition = photoComposition(photo);
+  const key = JSON.stringify(composition);
+  if (!compositionHasEffect(composition)) {
+    if (comparisonOriginalUrl) URL.revokeObjectURL(comparisonOriginalUrl);
+    comparisonOriginalUrl = undefined;
+    comparisonCompositionKey = undefined;
+    byId("image-original").src = originalUrl;
+    return;
+  }
+  if (comparisonCompositionKey === key && comparisonOriginalUrl) {
+    byId("image-original").src = comparisonOriginalUrl;
+    return;
+  }
+  const blob = await renderBlob(photo, { composition }, null, controller.signal);
+  if (!current()) return;
+  const url = URL.createObjectURL(blob);
+  if (comparisonOriginalUrl) URL.revokeObjectURL(comparisonOriginalUrl);
+  comparisonOriginalUrl = url;
+  comparisonCompositionKey = key;
+  byId("image-original").src = url;
+  await waitForImage(byId("image-original"));
 }
 
 async function renderFull(photo, controller, current) {
@@ -1149,15 +1792,21 @@ async function renderFull(photo, controller, current) {
   renderStatus("正在读取实际像素");
   let candidateUrl;
   try {
+    const composition = photoComposition(photo);
+    const compositionKey = JSON.stringify(composition);
+    if (fullOriginal && fullOriginal.compositionKey !== compositionKey) {
+      URL.revokeObjectURL(fullOriginal.url);
+      fullOriginal = undefined;
+    }
     if (!fullOriginal) {
-      const blob = await renderBlob(photo, {}, null, controller.signal, "full");
+      const blob = await renderBlob(photo, { composition }, null, controller.signal, "full");
       if (!current() || !actualZoom) return;
       const image = new Image();
       candidateUrl = URL.createObjectURL(blob);
       image.src = candidateUrl;
       await waitForImage(image);
       if (!current() || !actualZoom) return;
-      fullOriginal = { url: candidateUrl, width: image.naturalWidth, height: image.naturalHeight };
+      fullOriginal = { url: candidateUrl, width: image.naturalWidth, height: image.naturalHeight, compositionKey };
       candidateUrl = undefined;
     }
     const blob = hasAdjustments(photo)
@@ -1213,6 +1862,17 @@ function schedulePreview() {
         : null;
       if (!current()) return;
       showEdited(blob, originalUrl);
+      if (blob) {
+        await waitForImage(byId("image-edited"));
+        if (!current()) return;
+        aspect = byId("image-edited").naturalWidth / byId("image-edited").naturalHeight;
+      } else {
+        const source = sourceDimensions();
+        aspect = source.width && source.height ? source.width / source.height : aspect;
+      }
+      if (!actualZoom) await refreshComparisonOriginal(photo, controller, current);
+      if (!current()) return;
+      if (!actualZoom && tab !== "composition") fitImage();
       renderStatus("预览");
       if (actualZoom) fullRenderTimer = setTimeout(() => renderFull(photo, controller, current), 450);
     } catch (error) {
@@ -1222,6 +1882,68 @@ function schedulePreview() {
       }
     }
   }, 170);
+}
+
+function clippingMask(source, key) {
+  const cached = clippingMasks.get(source);
+  if (cached?.key === key) return cached.canvas;
+  const canvas = document.createElement("canvas");
+  canvas.width = source.naturalWidth || source.width;
+  canvas.height = source.naturalHeight || source.height;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  context.drawImage(source, 0, 0, canvas.width, canvas.height);
+  const image = context.getImageData(0, 0, canvas.width, canvas.height);
+  const pixels = image.data;
+  for (let index = 0; index < pixels.length; index += 4) {
+    const alpha = pixels[index + 3];
+    const highlight = pixels[index] >= 250 || pixels[index + 1] >= 250 || pixels[index + 2] >= 250;
+    const shadow = pixels[index] <= 5 && pixels[index + 1] <= 5 && pixels[index + 2] <= 5;
+    if (alpha && (highlight || shadow)) {
+      pixels[index] = highlight ? 255 : 48;
+      pixels[index + 1] = highlight ? 48 : 112;
+      pixels[index + 2] = highlight ? 48 : 255;
+      pixels[index + 3] = Math.min(alpha, 225);
+    } else pixels[index + 3] = 0;
+  }
+  context.putImageData(image, 0, 0);
+  clippingMasks.set(source, { key, canvas });
+  return canvas;
+}
+
+function updateClippingOverlay() {
+  const overlay = byId("clipping-overlay");
+  if (!overlay) return;
+  const ready = Boolean(currentPhoto() && originalUrl && !byId("view").hidden);
+  byId("clipping-toggle").disabled = !ready;
+  byId("clipping-toggle").setAttribute("aria-pressed", String(clippingEnabled));
+  const composing = tab === "composition";
+  const source = byId(composing ? "composition-canvas" : "image-edited");
+  const sourceReady = composing ? compositionBaseId === currentId && Boolean(compositionBaseImage) : source.complete && source.naturalWidth > 0;
+  const visible = Boolean(clippingEnabled && ready && sourceReady && !byId("photo-stack").classList.contains("peek-original"));
+  overlay.hidden = !visible;
+  byId("clipping-legend").hidden = !visible;
+  if (!visible) return;
+  const mask = clippingMask(source, composing ? compositionPaintSequence : source.currentSrc || source.src);
+  overlay.width = mask.width;
+  overlay.height = mask.height;
+  const context = overlay.getContext("2d");
+  context.save();
+  if (composing) {
+    // Composition shows the whole transformed photo, not the cropped output image.
+    // Clip the viewing aid to both the active crop polygon and the image's alpha.
+    const points = cropPathPoints(cropRect());
+    context.beginPath();
+    points.forEach((point, index) => {
+      const x = point.x * overlay.width;
+      const y = point.y * overlay.height;
+      if (index) context.lineTo(x, y);
+      else context.moveTo(x, y);
+    });
+    context.closePath();
+    context.clip();
+  }
+  context.drawImage(mask, 0, 0);
+  context.restore();
 }
 
 const histogramSample = document.createElement("canvas");
@@ -1650,8 +2372,14 @@ function wireEvents() {
   window.addEventListener("resize", fitVisibleImage);
 
   window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && whiteBalanceActive) {
+      event.preventDefault();
+      setWhiteBalanceMode(false, true);
+      setStatus("已取消白平衡取样。");
+      return;
+    }
     if (event.code !== "Space" || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey ||
-        !originalUrl || byId("view").hidden || editingRegion || document.querySelector("dialog[open]") ||
+        !originalUrl || byId("view").hidden || editingRegion || whiteBalanceActive || document.querySelector("dialog[open]") ||
         event.target.closest?.("input, textarea, select, button, a, [contenteditable]")) return;
     event.preventDefault();
     if (peekingOriginal) return;
@@ -1665,10 +2393,16 @@ function wireEvents() {
   };
   window.addEventListener("keyup", (event) => { if (event.code === "Space") stopPeeking(); });
   window.addEventListener("blur", stopPeeking);
-  on("image-edited", "load", drawHistogram);
+  on("image-edited", "load", () => { drawHistogram(); updateClippingOverlay(); });
+  on("clipping-toggle", "click", () => {
+    clippingEnabled = !clippingEnabled;
+    updateClippingOverlay();
+    setStatus(clippingEnabled ? "已显示剪切提示：红色为高光，蓝色为阴影；仅供查看，不影响导出。" : "已隐藏剪切提示。");
+  });
   on("reset-photo", "click", () => {
     const photo = currentPhoto();
     if (!photo) return;
+    setWhiteBalanceMode(false);
     photo.settings = { ...defaults, masks: [] };
     photo.lutId = null;
     selectedMaskId = null;
@@ -1686,6 +2420,7 @@ function wireEvents() {
   }
 
   const stack = byId("photo-stack");
+  stack.addEventListener("pointerdown", sampleWhiteBalance, true);
   on("photo-stack", "pointerdown", (event) => {
     if (!editingRegion || event.button !== 0) return;
     event.preventDefault();
@@ -1761,14 +2496,83 @@ function wireEvents() {
     if ((key === "radius-x" && delta[1]) || (key === "radius-y" && delta[0])) return;
     event.preventDefault();
     let point;
-    if (mask.type === "linear") point = { x: mask.geometry[key].x + delta[0], y: mask.geometry[key].y + delta[1] };
-    else if (key === "center") point = { x: mask.geometry.center.x + delta[0], y: mask.geometry.center.y + delta[1] };
-    else if (key === "radius-x") point = { x: mask.geometry.center.x + mask.geometry.radius.x + delta[0], y: mask.geometry.center.y };
-    else point = { x: mask.geometry.center.x, y: mask.geometry.center.y + mask.geometry.radius.y + delta[1] };
-    moveMaskHandle(mask, key, { x: Math.max(0, Math.min(1, point.x)), y: Math.max(0, Math.min(1, point.y)) });
+    if (mask.type === "linear") point = { ...mask.geometry[key] };
+    else if (key === "center") point = { ...mask.geometry.center };
+    else if (key === "radius-x") point = { x: mask.geometry.center.x + mask.geometry.radius.x, y: mask.geometry.center.y };
+    else point = { x: mask.geometry.center.x, y: mask.geometry.center.y + mask.geometry.radius.y };
+    const screenPoint = sourcePointToOutput(point);
+    const sourcePoint = outputPointToSource({ x: screenPoint.x + delta[0], y: screenPoint.y + delta[1] });
+    moveMaskHandle(mask, key, { x: Math.max(0, Math.min(1, sourcePoint.x)), y: Math.max(0, Math.min(1, sourcePoint.y)) });
     dirty = true;
     updateMaskOverlay();
     schedulePreview();
+  });
+
+  const cropCanvas = byId("composition-overlay");
+  cropCanvas.addEventListener("pointerdown", (event) => {
+    const photo = currentPhoto();
+    if (tab !== "composition" || !photo || event.button !== 0) return;
+    const handle = event.target.closest?.("[data-crop-handle]");
+    const moveTarget = event.target.closest?.("[data-crop-move]");
+    if (!handle && !moveTarget) return;
+    event.preventDefault();
+    const before = photo.settings.composition ? structuredClone(photo.settings.composition) : null;
+    const composition = ensureComposition(photo);
+    compositionGesture = {
+      pointerId: event.pointerId,
+      kind: handle ? "resize" : "move",
+      handle: handle?.dataset.cropHandle || null,
+      startPoint: compositionPointerPoint(event),
+      startCrop: cropRect(composition),
+      before
+    };
+    cropCanvas.setPointerCapture(event.pointerId);
+  });
+  cropCanvas.addEventListener("pointermove", updateCompositionGesture);
+  cropCanvas.addEventListener("pointerup", (event) => {
+    if (!compositionGesture || compositionGesture.pointerId !== event.pointerId) return;
+    updateCompositionGesture(event);
+    compositionGesture = null;
+    syncCompositionPanel();
+    schedulePreview();
+    setStatus("已更新裁剪范围");
+  });
+  cropCanvas.addEventListener("pointercancel", (event) => {
+    if (!compositionGesture || compositionGesture.pointerId !== event.pointerId) return;
+    const before = compositionGesture.before;
+    const photo = currentPhoto();
+    if (photo) {
+      if (before) photo.settings.composition = before;
+      else delete photo.settings.composition;
+    }
+    compositionGesture = null;
+    syncCompositionPanel();
+    fitCompositionStage();
+  });
+  cropCanvas.addEventListener("keydown", (event) => {
+    const handle = event.target.closest?.("[data-crop-handle]");
+    const photo = currentPhoto();
+    if (!handle || !photo) return;
+    const movement = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[event.key];
+    if (!movement) return;
+    event.preventDefault();
+    const composition = ensureComposition(photo);
+    const crop = cropRect(composition);
+    const positions = {
+      nw: { x: crop.x, y: crop.y },
+      ne: { x: crop.x + crop.width, y: crop.y },
+      se: { x: crop.x + crop.width, y: crop.y + crop.height },
+      sw: { x: crop.x, y: crop.y + crop.height }
+    };
+    const screen = cropPointToScreen(positions[handle.dataset.cropHandle], composition);
+    const step = (event.shiftKey ? 0.05 : 0.01);
+    const next = screenPointToCrop({ x: screen.x + movement[0] * step, y: screen.y + movement[1] * step }, composition);
+    composition.crop = resizeCropCorner(crop, handle.dataset.cropHandle, next, composition);
+    dirty = true;
+    syncCompositionPanel();
+    fitCompositionStage();
+    schedulePreview();
+    byId("composition-overlay").querySelector('.crop-handle[data-crop-handle="' + handle.dataset.cropHandle + '"]')?.focus();
   });
 
   const drop = byId("drop-hint");
