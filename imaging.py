@@ -493,6 +493,57 @@ def _decode(path, edge=None):
         return np.asarray(image, dtype=np.float32) / 255
 
 
+def estimate_white_balance(rgb, x, y):
+    """Estimate absolute temperature/tint slider values from normalized source coordinates."""
+    x = _unit_value(x, "取样点横坐标")
+    y = _unit_value(y, "取样点纵坐标")
+    if not isinstance(rgb, np.ndarray) or rgb.ndim != 3 or rgb.shape[2] < 3:
+        raise ValueError("无法读取白平衡取样图像")
+    height, width = rgb.shape[:2]
+    if height < 1 or width < 1:
+        raise ValueError("白平衡取样图像为空")
+
+    center_x = round(x * (width - 1))
+    center_y = round(y * (height - 1))
+    left, right = max(0, center_x - 4), min(width, center_x + 5)
+    top, bottom = max(0, center_y - 4), min(height, center_y + 5)
+    sample = np.median(rgb[top:bottom, left:right, :3], axis=(0, 1)).astype(np.float64)
+    if not np.isfinite(sample).all():
+        raise ValueError("取样区域过亮、过暗或颜色过饱和，请点击未剪切的中性灰或白色区域。")
+    brightest = float(sample.max())
+    darkest = float(sample.min())
+    if (darkest <= 5 / 255 or brightest >= 250 / 255 or
+            (brightest - darkest) / max(brightest, 1e-9) > 0.55):
+        raise ValueError("取样区域过亮、过暗或颜色过饱和，请点击未剪切的中性灰或白色区域。")
+
+    linear = np.where(sample <= 0.04045, sample / 12.92,
+                      ((sample + 0.055) / 1.055) ** 2.4)
+    red_blue_ratio = max(float(linear[0]), 1e-9) / max(float(linear[2]), 1e-9)
+    temperature = float(np.clip(-math.log2(red_blue_ratio) / 0.8, -1, 1))
+    gains = np.array((2 ** (temperature * 0.35), 1,
+                      2 ** (-temperature * 0.45)), dtype=np.float64)
+    balanced_linear = linear * gains
+    balanced = np.where(balanced_linear <= 0.0031308,
+                        12.92 * balanced_linear,
+                        1.055 * balanced_linear ** (1 / 2.4) - 0.055)
+
+    luma_red, luma_green, luma_blue = (0.2126, 0.7152, 0.0722)
+    magenta_green = -((luma_red + luma_blue) / luma_green)
+    luminance = float(balanced @ np.array((luma_red, luma_green, luma_blue)))
+    tint_scale = 0.58 * luminance * (1 - luminance)
+    tint = (balanced[1] - (balanced[0] + balanced[2]) / 2) / max(
+        tint_scale * (1 - magenta_green), 1e-9
+    )
+    return {
+        "temperature": int(round(temperature * 100)),
+        "tint": int(round(float(np.clip(tint, -1, 1)) * 100)),
+    }
+
+
+def sample_white_balance(path: Path, x, y):
+    return estimate_white_balance(_decode(path, PREVIEW_EDGE), x, y)
+
+
 @lru_cache(maxsize=8)
 def _decode_preview(path, modified, byte_count):
     return _decode(path, PREVIEW_EDGE)

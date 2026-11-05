@@ -23,7 +23,8 @@ sys.path.insert(0, str(ROOT / "vendor"))
 
 from PIL import Image, ImageCms
 from engine_adapters import capabilities, decode_raw, open_in_patchy
-from imaging import render, validate_composition, validate_lut, validate_masks
+from imaging import (render, sample_white_balance, validate_composition,
+                     validate_lut, validate_masks)
 
 DATA = ROOT / "数据"
 PHOTOS = DATA / "原片"
@@ -265,6 +266,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def post(self, route: str, query: dict):
         if route == "/api/import":
             self.import_photo(query.get("name", ""))
+        elif route == "/api/white-balance":
+            request = self.json_body()
+            photo_id = request.get("id")
+            with IMAGE_JOBS:
+                settings = sample_white_balance(render_source(photo_id),
+                                                request.get("x"), request.get("y"))
+            self.json(settings)
         elif route == "/api/lut":
             self.import_lut(query.get("name", ""))
         elif route == "/api/preferences":
