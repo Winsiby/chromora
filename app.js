@@ -382,6 +382,172 @@ function controlGroup(container, title, keys, suffix) {
   container.append(group);
 }
 
+function normalizedGradeHue(hue) {
+  const numeric = Number.isFinite(hue) ? hue : 0;
+  return ((numeric % 360) + 360) % 360;
+}
+
+function gradeWheelMarkerPosition(hue, saturation) {
+  const angle = normalizedGradeHue(hue) * Math.PI / 180;
+  const radius = 0.425 * Math.max(0, Math.min(100, Number(saturation) || 0)) / 100;
+  return { x: 0.5 + Math.sin(angle) * radius, y: 0.5 - Math.cos(angle) * radius };
+}
+
+function gradeWheelValuesAtPoint(x, y, previousHue = 0) {
+  const dx = x - 0.5;
+  const dy = y - 0.5;
+  const distance = Math.min(0.5, Math.hypot(dx, dy));
+  const hue = distance < 0.005
+    ? normalizedGradeHue(previousHue)
+    : Math.round(normalizedGradeHue(Math.atan2(dx, -dy) * 180 / Math.PI)) % 360;
+  return { hue, saturation: Math.round(distance * 200) };
+}
+
+function gradeNumberField(band, key, label, unit) {
+  const [, min, max, step, initial] = controls[key];
+  const field = document.createElement("div");
+  field.className = "grade-number-field";
+  const title = document.createElement("label");
+  title.htmlFor = "grade-number-" + key;
+  title.textContent = label;
+  const wrap = document.createElement("div");
+  wrap.className = "grade-number-wrap";
+  const input = document.createElement("input");
+  input.type = "number";
+  input.id = title.htmlFor;
+  input.className = "grade-number-input";
+  input.setAttribute("aria-label", gradeBands[band][0] + label + (unit === "°" ? "（度）" : "（百分比）"));
+  input.min = min;
+  input.max = max;
+  input.step = step;
+  input.value = initial;
+  input.disabled = true;
+  input.addEventListener("change", () => {
+    if (!Number.isFinite(input.valueAsNumber)) {
+      syncControls();
+      return;
+    }
+    setControl(key, input.valueAsNumber);
+  });
+  const suffix = document.createElement("span");
+  suffix.setAttribute("aria-hidden", "true");
+  suffix.textContent = unit;
+  wrap.append(input, suffix);
+  field.append(title, wrap);
+  if (!inputPairs.has(key)) inputPairs.set(key, []);
+  inputPairs.get(key).push([input]);
+  return field;
+}
+
+function syncGradeWheels() {
+  const photo = currentPhoto();
+  for (const wheel of selectAll("[data-grade-wheel]")) {
+    const band = wheel.dataset.gradeWheel;
+    const hue = photo?.settings[band + "Hue"] ?? defaults[band + "Hue"];
+    const saturation = photo?.settings[band + "Sat"] ?? defaults[band + "Sat"];
+    const marker = gradeWheelMarkerPosition(hue, saturation);
+    wheel.style.setProperty("--marker-x", (marker.x * 100) + "%");
+    wheel.style.setProperty("--marker-y", (marker.y * 100) + "%");
+    wheel.setAttribute("aria-label", gradeBands[band][0] + "色轮，色相 " + hue + " 度，饱和度 " + saturation + "%");
+    wheel.setAttribute("aria-disabled", String(!photo));
+    wheel.tabIndex = photo ? 0 : -1;
+  }
+}
+
+function gradeWheelControls(parent) {
+  const stack = document.createElement("div");
+  stack.className = "grade-wheel-stack";
+  const help = document.createElement("p");
+  help.id = "grade-wheel-help";
+  help.className = "grade-wheel-help";
+  help.textContent = "拖动或点选色轮；←/→ 调色相，↑/↓ 调饱和度。按住 Shift 加大步进，Home/End 调至 0/100%。";
+  stack.append(help);
+
+  for (const [band, [label]] of Object.entries(gradeBands)) {
+    const section = document.createElement("section");
+    section.className = "grade-band";
+    const heading = document.createElement("h3");
+    heading.textContent = label;
+    const row = document.createElement("div");
+    row.className = "grade-wheel-row";
+    const wheel = document.createElement("div");
+    wheel.className = "grade-wheel";
+    wheel.dataset.gradeWheel = band;
+    wheel.tabIndex = -1;
+    wheel.setAttribute("role", "group");
+    wheel.setAttribute("aria-describedby", help.id);
+    const marker = document.createElement("span");
+    marker.className = "grade-wheel-marker";
+    marker.setAttribute("aria-hidden", "true");
+    wheel.append(marker);
+    const fields = document.createElement("div");
+    fields.className = "grade-field-grid";
+    fields.setAttribute("role", "group");
+    fields.setAttribute("aria-label", label + "色轮数值");
+    fields.append(
+      gradeNumberField(band, band + "Hue", "色相", "°"),
+      gradeNumberField(band, band + "Sat", "饱和度", "%")
+    );
+    row.append(wheel, fields);
+    section.append(heading, row);
+    stack.append(section);
+
+    let pointerId = null;
+    const updateFromPointer = (event) => {
+      const rect = wheel.getBoundingClientRect();
+      const size = Math.min(rect.width, rect.height);
+      if (!size) return;
+      const left = rect.left + (rect.width - size) / 2;
+      const top = rect.top + (rect.height - size) / 2;
+      const values = gradeWheelValuesAtPoint(
+        (event.clientX - left) / size,
+        (event.clientY - top) / size,
+        currentPhoto()?.settings[band + "Hue"] ?? defaults[band + "Hue"]
+      );
+      const photo = currentPhoto();
+      if (!photo) return;
+      if (photo.settings[band + "Hue"] !== values.hue) setControl(band + "Hue", values.hue);
+      if (photo.settings[band + "Sat"] !== values.saturation) setControl(band + "Sat", values.saturation);
+    };
+    wheel.addEventListener("pointerdown", (event) => {
+      if (!currentPhoto() || event.button !== 0 || event.isPrimary === false) return;
+      event.preventDefault();
+      pointerId = event.pointerId;
+      wheel.setPointerCapture(pointerId);
+      updateFromPointer(event);
+    });
+    wheel.addEventListener("pointermove", (event) => {
+      if (event.pointerId === pointerId) updateFromPointer(event);
+    });
+    for (const eventName of ["pointerup", "pointercancel", "lostpointercapture"]) {
+      wheel.addEventListener(eventName, () => { pointerId = null; });
+    }
+    wheel.addEventListener("keydown", (event) => {
+      const photo = currentPhoto();
+      if (!photo) return;
+      const step = event.shiftKey ? 10 : 1;
+      const hueKey = band + "Hue";
+      const saturationKey = band + "Sat";
+      const hue = photo.settings[hueKey] ?? defaults[hueKey];
+      const saturation = photo.settings[saturationKey] ?? defaults[saturationKey];
+      if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        event.preventDefault();
+        setControl(hueKey, normalizedGradeHue(hue + (event.key === "ArrowRight" ? step : -step)));
+      } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+        event.preventDefault();
+        setControl(saturationKey, saturation + (event.key === "ArrowUp" ? step : -step));
+      } else if (event.key === "PageUp" || event.key === "PageDown") {
+        event.preventDefault();
+        setControl(saturationKey, saturation + (event.key === "PageUp" ? 10 : -10));
+      } else if (event.key === "Home" || event.key === "End") {
+        event.preventDefault();
+        setControl(saturationKey, event.key === "End" ? 100 : 0);
+      }
+    });
+  }
+  parent.append(stack);
+}
+
 function setControl(key, value) {
   const photo = currentPhoto();
   if (!photo) return;
@@ -407,6 +573,7 @@ function syncControls() {
       }
     }
   }
+  syncGradeWheels();
 
   byId("reset-photo").disabled = !photo;
   byId("project-save").disabled = !photo;
@@ -1120,7 +1287,7 @@ function preparePanels() {
   prepareCurve(editorSection(landscape, "curve-section", "曲线"));
   bandControls(editorSection(landscape, "mixer-section", "色彩混合"), "hsl", hslBands, hslAdjustments);
   const grading = editorSection(landscape, "grade-section", "色彩分级");
-  bandControls(grading, "grade", gradeBands, gradeAdjustments);
+  gradeWheelControls(grading);
   controlGroup(grading, "", ["colorBalance"]);
   controlGroup(editorSection(landscape, "detail-section", "细节"), "", detailKeys);
   const styleShortcut = document.createElement("div");
