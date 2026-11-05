@@ -86,6 +86,12 @@ def validate_project_state(state: dict, *, check_originals: bool = False) -> Non
             raise ValueError(f"工程中的第 {index + 1} 张照片数据无效。")
         if check_originals:
             original_path(photo.get("id"))
+        rating = photo.get("rating", 0)
+        if isinstance(rating, bool) or not isinstance(rating, int) or not 0 <= rating <= 5:
+            raise ValueError(f"工程中的第 {index + 1} 张照片星级必须是 0 到 5 的整数。")
+        flag = photo.get("flag")
+        if flag is not None and flag not in ("pick", "reject"):
+            raise ValueError(f"工程中的第 {index + 1} 张照片旗标无效。")
         settings = photo.get("settings", {})
         if not isinstance(settings, dict):
             raise ValueError(f"工程中的第 {index + 1} 张照片调整参数无效。")
