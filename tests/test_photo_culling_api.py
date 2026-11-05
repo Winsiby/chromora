@@ -102,6 +102,17 @@ class PhotoCullingProjectApiTests(unittest.TestCase):
         restored = json.loads(body)["state"]["photos"][0]
         self.assertEqual((restored["rating"], restored["flag"]), (2, "reject"))
 
+    def test_rating_boundaries_and_all_valid_flags_round_trip(self):
+        for index, (rating, flag) in enumerate(((0, None), (0, "pick"), (5, "reject"))):
+            with self.subTest(rating=rating, flag=flag):
+                name = f"valid-culling-{index}"
+                status, body = self.save_project(name, self.base_state({"rating": rating, "flag": flag}))
+                self.assertEqual(status, 200, body.decode("utf-8", "replace"))
+                status, body = self.load_project(name)
+                self.assertEqual(status, 200, body.decode("utf-8", "replace"))
+                restored = json.loads(body)["state"]["photos"][0]
+                self.assertEqual((restored["rating"], restored["flag"]), (rating, flag))
+
     def test_legacy_projects_without_culling_fields_still_open(self):
         state = self.base_state()
         status, body = self.save_project("legacy-without-culling", state)
