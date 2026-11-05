@@ -1,0 +1,17 @@
+# 第三方工具与依赖，体积大，不入库
+Tools/
+vendor/
+
+# 用户数据：原片、工程、缩略图、风格、本机设置
+数据/
+
+# 导出成片
+导出/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 系统文件
+Thumbs.db
+.DS_Store

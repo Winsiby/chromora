@@ -1,0 +1,366 @@
+from __future__ import annotations
+
+from functools import lru_cache
+from io import BytesIO
+import math
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageCms, ImageFilter, ImageOps
+import tifffile
+
+from color_tools import apply_color_tools
+from detail_tools import apply_detail_tools
+
+PREVIEW_EDGE = 1440
+SRGB_PROFILE = ImageCms.createProfile("sRGB")
+SRGB_ICC = ImageCms.ImageCmsProfile(SRGB_PROFILE).tobytes()
+LUMA = np.array((0.2126, 0.7152, 0.0722), dtype=np.float32)
+
+
+def _number(settings, key, low, high, default=0.0):
+    value = settings.get(key, default)
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise ValueError(f"{key} 的数值无效")
+    return min(high, max(low, value))
+
+
+@lru_cache(maxsize=4)
+def _read_cube(path, modified, byte_count):
+    size = 0
+    rows = 0
+    lower = np.zeros(3, dtype=np.float32)
+    upper = np.ones(3, dtype=np.float32)
+    bounds = set()
+    try:
+        with path.open(encoding="utf-8-sig") as source:
+            for line in source:
+                tokens = line.partition("#")[0].split()
+                if not tokens:
+                    continue
+                command = tokens[0].upper()
+                if command == "TITLE":
+                    continue
+                if command == "LUT_3D_SIZE" and len(tokens) == 2 and not size:
+                    size = int(tokens[1])
+                    if not 2 <= size <= 128:
+                        raise ValueError("LUT 网格应在 2 到 128 之间")
+                    samples = np.empty((size ** 3, 3), dtype=np.float32)
+                    continue
+                if command in {"DOMAIN_MIN", "DOMAIN_MAX"} and len(tokens) == 4 and not rows:
+                    if command in bounds:
+                        raise ValueError("LUT 输入范围重复")
+                    bounds.add(command)
+                    values = np.array([float(value) for value in tokens[1:]], dtype=np.float32)
+                    if command == "DOMAIN_MIN":
+                        lower = values
+                    else:
+                        upper = values
+                    continue
+                if command == "LUT_3D_INPUT_RANGE" and len(tokens) == 3 and not rows and not bounds:
+                    lower.fill(float(tokens[1]))
+                    upper.fill(float(tokens[2]))
+                    bounds.update(("DOMAIN_MIN", "DOMAIN_MAX"))
+                    continue
+                if command in {"LUT_1D_SIZE", "LUT_1D_INPUT_RANGE"}:
+                    raise ValueError("请选择独立的 3D .cube，当前不支持一维或混合 LUT")
+                if not size or len(tokens) != 3 or rows >= len(samples):
+                    raise ValueError("LUT 的采样表尺寸或行格式有误")
+                samples[rows] = [float(value) for value in tokens]
+                rows += 1
+    except UnicodeError as error:
+        raise ValueError("LUT 应为 UTF-8 或 ASCII 文本") from error
+
+    if not size or rows != size ** 3:
+        raise ValueError("LUT 采样行数与网格尺寸不符")
+    span = upper.astype(np.float64) - lower
+    if not np.isfinite(samples).all() or not np.isfinite(span).all() or np.any(span < 1e-12):
+        raise ValueError("LUT 含有无效的数值或输入范围")
+    return samples.reshape((size, size, size, 3)), lower, upper
+
+
+def _cube(path):
+    info = path.stat()
+    if info.st_size > 64 * 1024 ** 2:
+        raise ValueError("LUT 文件超过 64 MB")
+    return _read_cube(path, info.st_mtime_ns, info.st_size)
+
+
+def validate_lut(path: Path) -> None:
+    try:
+        _cube(path)
+    except (ValueError, OverflowError) as error:
+        raise ValueError(f"无法读取 .cube：{error}") from error
+
+
+def _apply_table(rgb, table, lower, upper, strength):
+    size = table.shape[0]
+    input_pixels = rgb.reshape((-1, 3))
+    for start in range(0, len(input_pixels), 120_000):
+        pixels = input_pixels[start:start + 120_000]
+        points = np.clip((pixels - lower) / (upper - lower), 0, 1) * (size - 1)
+        low = points.astype(np.intp)
+        high = np.minimum(low + 1, size - 1)
+        frac = (points - low).astype(np.float32)
+        result = np.zeros_like(pixels)
+        # .cube stores red fastest, so the table axes are blue, green, red.
+        for corner in range(8):
+            red = bool(corner & 1)
+            green = bool(corner & 2)
+            blue = bool(corner & 4)
+            weight = (frac[:, 0] if red else 1 - frac[:, 0])
+            weight = weight * (frac[:, 1] if green else 1 - frac[:, 1])
+            weight *= frac[:, 2] if blue else 1 - frac[:, 2]
+            result += table[
+                (high if blue else low)[:, 2],
+                (high if green else low)[:, 1],
+                (high if red else low)[:, 0],
+            ] * weight[:, None]
+        pixels += (result - pixels) * strength
+
+
+@lru_cache(maxsize=4)
+def _icc_table(profile):
+    source = ImageCms.ImageCmsProfile(BytesIO(profile))
+    if ImageCms.getProfileDescription(source).strip().casefold() in {
+        "srgb built-in", "srgb iec61966-2.1", "srgb iec61966-2.1 black scaled",
+    }:
+        return None
+    # Sample the 8-bit CMS path, then interpolate the source's 16-bit values.
+    blue, green, red = np.indices((33, 33, 33))
+    samples = np.stack((red, green, blue), axis=-1).reshape((33 * 33, 33, 3))
+    pattern = Image.fromarray(np.rint(samples * (255 / 32)).astype(np.uint8))
+    converted = ImageCms.profileToProfile(pattern, source, SRGB_PROFILE, outputMode="RGB")
+    return (np.asarray(converted, dtype=np.float32) / 255).reshape((33, 33, 33, 3))
+
+
+def _to_srgb(image, profile):
+    if profile and profile != SRGB_ICC:
+        try:
+            source = ImageCms.ImageCmsProfile(BytesIO(profile))
+            return ImageCms.profileToProfile(image, source, SRGB_PROFILE, outputMode="RGB")
+        except (OSError, TypeError, ValueError, ImageCms.PyCMSError):
+            pass
+    return image.convert("RGB")
+
+
+def _orient(rgb, orientation):
+    match orientation:
+        case 2:
+            return rgb[:, ::-1]
+        case 3:
+            return rgb[::-1, ::-1]
+        case 4:
+            return rgb[::-1]
+        case 5:
+            return rgb.transpose((1, 0, 2))
+        case 6:
+            return np.rot90(rgb, -1)
+        case 7:
+            return rgb.transpose((1, 0, 2))[::-1, ::-1]
+        case 8:
+            return np.rot90(rgb, 1)
+        case _:
+            return rgb
+
+
+def _target_size(width, height, edge):
+    scale = min(1, edge / max(width, height))
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def _read_deep_tiff(path, edge):
+    with tifffile.TiffFile(path) as container:
+        page = container.pages[0]
+        if page.photometric not in (0, 1, 2):
+            return None
+        pixels = page.asarray()
+        if page.axes in ("SYX", "CYX"):
+            pixels = np.moveaxis(pixels, 0, -1)
+        if pixels.ndim == 2:
+            pixels = np.repeat(pixels[:, :, None], 3, axis=2)
+        if pixels.ndim != 3 or pixels.shape[2] not in (3, 4):
+            return None
+        if pixels.dtype.kind not in ("u", "f"):
+            return None
+        orientation = page.tags.get(274)
+        profile_tag = page.tags.get(34675)
+        profile = bytes(profile_tag.value) if profile_tag else None
+        rgb = _orient(pixels[:, :, :3], orientation.value if orientation else 1)
+        target_size = _target_size(rgb.shape[1], rgb.shape[0], edge) if edge else None
+        divisor = (2 ** page.bitspersample - 1) if rgb.dtype.kind == "u" else 1
+        if target_size and target_size != (rgb.shape[1], rgb.shape[0]):
+            channels = (
+                Image.fromarray(np.asarray(rgb[:, :, index], dtype=np.float32)).resize(
+                    target_size, Image.Resampling.LANCZOS
+                )
+                for index in range(3)
+            )
+            rgb = np.stack([np.asarray(channel) for channel in channels], axis=-1)
+        else:
+            rgb = np.array(rgb, dtype=np.float32, order="C")
+        rgb /= divisor
+        if page.photometric == 0:
+            np.subtract(1, rgb, out=rgb)
+        if profile and profile != SRGB_ICC:
+            try:
+                table = _icc_table(profile)
+                if table is not None:
+                    _apply_table(rgb, table, 0, 1, 1)
+            except (OSError, TypeError, ValueError, ImageCms.PyCMSError):
+                pass
+        return np.clip(rgb, 0, 1, out=rgb)
+
+
+def _decode(path, edge=None):
+    with Image.open(path) as source:
+        profile = source.info.get("icc_profile")
+        if source.format == "TIFF" and max(source.tag_v2.get(258, (8,))) > 8:
+            try:
+                rgb = _read_deep_tiff(path, edge)
+            except (OSError, ValueError, NotImplementedError):
+                rgb = None
+            if rgb is not None:
+                return rgb
+            # shortcut: obscure compressed TIFF layouts use Pillow's RGB conversion.
+        image = ImageOps.exif_transpose(source)
+        if edge:
+            image.thumbnail((edge, edge), Image.Resampling.LANCZOS)
+        if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+            overlay = image.convert("RGBA")
+            alpha = overlay.getchannel("A")
+            image = Image.composite(_to_srgb(overlay.convert("RGB"), profile),
+                                    Image.new("RGB", overlay.size, "white"), alpha)
+        else:
+            image = _to_srgb(image, profile)
+        return np.asarray(image, dtype=np.float32) / 255
+
+
+@lru_cache(maxsize=8)
+def _decode_preview(path, modified, byte_count):
+    return _decode(path, PREVIEW_EDGE)
+
+
+def _blur(plane, radius):
+    samples = np.rint(np.clip(plane, 0, 1) * 255).astype(np.uint8)
+    return np.asarray(Image.fromarray(samples).filter(ImageFilter.GaussianBlur(radius)),
+                      dtype=np.float32) / 255
+
+
+def _adjust(rgb, settings):
+    exposure = _number(settings, "exposure", -3, 3)
+    temperature = _number(settings, "temperature", -100, 100) / 100
+    shadows = _number(settings, "shadows", -100, 100) / 100
+    highlights = _number(settings, "highlights", -100, 100) / 100
+    contrast = _number(settings, "contrast", -100, 100) / 100
+    saturation = _number(settings, "saturation", -100, 100) / 100
+    clarity = _number(settings, "clarity", -100, 100) / 100
+
+    if exposure or temperature:
+        gains = np.array([2 ** (exposure + temperature * 0.35), 2 ** exposure,
+                          2 ** (exposure - temperature * 0.45)], dtype=np.float32)
+        for start in range(0, len(rgb), 256):
+            pixels = rgb[start:start + 256]
+            linear = np.where(pixels <= .04045, pixels / 12.92, ((pixels + .055) / 1.055) ** 2.4)
+            linear *= gains
+            pixels[:] = np.where(linear <= .0031308, 12.92 * linear,
+                                 1.055 * linear ** (1 / 2.4) - .055)
+    if shadows or highlights or contrast or saturation:
+        for start in range(0, len(rgb), 256):
+            pixels = rgb[start:start + 256]
+            lum = np.clip(pixels @ LUMA, 0, 1)
+            shift = shadows * .42 * lum * (1 - lum) ** 2
+            shift += highlights * .42 * lum ** 2 * (1 - lum)
+            pixels += shift[:, :, None]
+            pixels += contrast * .52 * (pixels - .5)
+            if saturation:
+                lum = pixels @ LUMA
+                pixels += saturation * (pixels - lum[:, :, None])
+    if clarity:
+        lum = np.clip(rgb @ LUMA, 0, 1)
+        detail = lum - _blur(lum, max(1.5, min(rgb.shape[:2]) / 160))
+        rgb += (detail * clarity * .85)[:, :, None]
+    np.clip(rgb, 0, 1, out=rgb)
+
+
+def _retouch(rgb, settings):
+    blemishes = _number(settings, "blemishes", 0, 100) / 100
+    smoothing = _number(settings, "smoothing", 0, 100) / 100
+    skin_tone = _number(settings, "skinTone", 0, 100) / 100
+    texture = _number(settings, "texture", 0, 100) / 100
+    region = settings.get("skinRegion")
+    if not region or not any((blemishes, smoothing, skin_tone, texture)):
+        return
+    if not isinstance(region, dict):
+        raise ValueError("皮肤区域格式无效")
+    height, width = rgb.shape[:2]
+    x = _number(region, "x", 0, 1)
+    y = _number(region, "y", 0, 1)
+    right = min(width, math.ceil((x + _number(region, "width", 0, 1)) * width))
+    bottom = min(height, math.ceil((y + _number(region, "height", 0, 1)) * height))
+    left, top = math.floor(x * width), math.floor(y * height)
+    if right - left < 4 or bottom - top < 4:
+        return
+    patch = rgb[top:bottom, left:right]
+    yy = np.linspace(-1, 1, bottom - top, dtype=np.float32)[:, None]
+    xx = np.linspace(-1, 1, right - left, dtype=np.float32)[None, :]
+    mask = np.clip((1 - yy * yy - xx * xx) * 3, 0, 1)
+    mask = (mask * mask * (3 - 2 * mask))[:, :, None]
+    radius = max(1, min(patch.shape[:2]) / 65)
+    softened = np.stack([_blur(patch[:, :, index], radius) for index in range(3)], axis=-1)
+    details = patch - softened
+    luminance_detail = details @ LUMA
+    fine_weight = np.clip(1 - np.abs(luminance_detail) * 9, 0, 1)[:, :, None]
+    change = -details * (smoothing * .75) * fine_weight
+    if skin_tone:
+        chroma = details - luminance_detail[:, :, None]
+        change -= chroma * skin_tone * .82
+    if texture:
+        change += (luminance_detail * texture * .5)[:, :, None] * fine_weight
+    if blemishes:
+        redness = details[:, :, 0] - details[:, :, 1]
+        marks = np.clip((redness - .015) * 12, 0, 1)
+        change -= details * (marks * blemishes * .95)[:, :, None]
+    patch += change * mask
+    np.clip(patch, 0, 1, out=patch)
+
+
+def render(path: Path, settings: dict, lut: Path | None, format: str, preview: bool = False) -> bytes:
+    if preview:
+        info = path.stat()
+        rgb = _decode_preview(path, info.st_mtime_ns, info.st_size).copy()
+    else:
+        rgb = _decode(path)
+    _adjust(rgb, settings)
+    apply_detail_tools(rgb, settings, preview)
+    _retouch(rgb, settings)
+    apply_color_tools(rgb, settings)
+    strength = _number(settings, "lutStrength", 0, 100, 100) / 100
+    if lut and strength:
+        table, lower, upper = _cube(lut)
+        _apply_table(rgb, table, lower, upper, strength)
+        np.clip(rgb, 0, 1, out=rgb)
+
+    finishing = {
+        "exposure": _number(settings, "postExposure", -3, 3),
+        "temperature": _number(settings, "postTemperature", -100, 100),
+        "contrast": _number(settings, "postContrast", -100, 100),
+    }
+    if any(finishing.values()):
+        _adjust(rgb, finishing)
+
+    target = BytesIO()
+    if format in ("tif", "tiff"):
+        tifffile.imwrite(target, np.rint(rgb * 65535).astype(np.uint16),
+                         photometric="rgb", compression="deflate", iccprofile=SRGB_ICC,
+                         metadata=None)
+    elif format in ("jpeg", "jpg", "png"):
+        output = Image.fromarray(np.rint(rgb * 255).astype(np.uint8))
+        if format == "png":
+            output.save(target, "PNG", icc_profile=SRGB_ICC)
+        else:
+            output.save(target, "JPEG", quality=88 if preview else 96, subsampling=0,
+                        icc_profile=SRGB_ICC)
+    else:
+        raise ValueError("不支持该导出格式")
+    return target.getvalue()

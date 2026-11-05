@@ -1,0 +1,13 @@
+@echo off
+setlocal
+chcp 65001 >nul
+pushd "%~dp0"
+where py.exe >nul 2>&1
+if errorlevel 1 (
+    python -X utf8 -B server.py
+) else (
+    py -3.14 -X utf8 -B server.py
+)
+if errorlevel 1 pause
+popd
+

@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Chromora · 本地修图</title>
+  <link rel="stylesheet" href="./app.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <svg class="sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-brand" viewBox="0 0 24 24"><path d="M4 9V5a1 1 0 0 1 1-1h4m6 0h4a1 1 0 0 1 1 1v4m0 6v4a1 1 0 0 1-1 1h-4m-6 0H5a1 1 0 0 1-1-1v-4"/><path d="M8 12h8m-4-4v8"/></symbol>
+    <symbol id="i-open" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v1H6l-3 9V7Z"/><path d="M3 19h16l3-9H6"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="8" r="1.5"/><path d="m4 18 5-5 3 3 3-4 5 6"/></symbol>
+    <symbol id="i-landscape" viewBox="0 0 24 24"><path d="m3 19 6-10 4 7 3-4 5 7H3Z"/><path d="M17 6h.01"/><circle cx="17" cy="6" r="2"/></symbol>
+    <symbol id="i-person" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21v-2a5 5 0 0 1 5-5h6a5 5 0 0 1 5 5v2"/></symbol>
+    <symbol id="i-style" viewBox="0 0 24 24"><circle cx="9" cy="9" r="5"/><circle cx="15" cy="9" r="5"/><circle cx="12" cy="15" r="5"/></symbol>
+    <symbol id="i-project" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 9h16m-10 0v11"/></symbol>
+    <symbol id="i-compare" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M12 3v18m-5-9h2m6 0h2"/></symbol>
+    <symbol id="i-export" viewBox="0 0 24 24"><path d="M12 4v11m-4-4 4 4 4-4m-12 4v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+    <symbol id="i-reset" viewBox="0 0 24 24"><path d="M4 11a8 8 0 1 1 2 7M4 4v7h7"/></symbol>
+    <symbol id="i-fit" viewBox="0 0 24 24"><path d="M9 4H4v5m11-5h5v5M4 15v5h5m11-5v5h-5"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="m9 7-5 5 5 5m6-10 5 5-5 5"/></symbol>
+    <symbol id="i-star" viewBox="0 0 24 24"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9L12 3Z"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+  </svg>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-icon"><svg><use href="#i-brand"></use></svg></span>
+      <div><h1>Chromora</h1><p>本地修图工作台</p></div>
+    </div>
+    <div class="open-actions">
+      <button class="button outline" id="open-files"><svg><use href="#i-open"></use></svg>打开照片</button>
+      <button class="button quiet" id="open-folder">打开文件夹</button>
+    </div>
+    <span class="workspace-title" id="workspace-title">未打开照片</span>
+    <div class="primary-actions">
+      <button class="button outline" id="compare-toggle" title="按住空格暂看原图" aria-pressed="true" disabled><svg><use href="#i-compare"></use></svg><span>原图对比</span></button>
+      <button class="button primary" id="export-open" disabled><svg><use href="#i-export"></use></svg>导出</button>
+    </div>
+  </header>
+
+  <main class="workbench">
+    <nav class="rail" aria-label="工作台工具">
+      <button type="button" data-tab="landscape" aria-pressed="true"><svg><use href="#i-landscape"></use></svg><span>调色</span></button>
+      <button type="button" data-tab="portrait" aria-pressed="false"><svg><use href="#i-person"></use></svg><span>人像</span></button>
+      <button type="button" data-tab="styles" aria-pressed="false"><svg><use href="#i-style"></use></svg><span>风格</span></button>
+      <button type="button" data-tab="project" aria-pressed="false"><svg><use href="#i-project"></use></svg><span>项目</span></button>
+    </nav>
+
+    <section class="photo-workspace" aria-label="照片工作区">
+      <div class="canvas-toolbar">
+        <div class="canvas-file"><svg><use href="#i-image"></use></svg><strong id="canvas-name">照片预览</strong></div>
+        <div class="canvas-actions" aria-label="预览缩放">
+          <button class="icon-button" type="button" id="zoom-out" aria-label="缩小预览" title="缩小预览" disabled><svg><use href="#i-minus"></use></svg></button>
+          <output id="zoom-label">适合窗口</output>
+          <button class="button small outline actual-button" type="button" id="zoom-actual" aria-pressed="false" title="按实际像素查看细节" disabled>100%</button>
+          <button class="icon-button" type="button" id="zoom-in" aria-label="放大预览" title="放大预览" disabled><svg><use href="#i-plus"></use></svg></button>
+          <button class="icon-button" type="button" id="zoom-fit" aria-label="适合窗口" title="适合窗口" disabled><svg><use href="#i-fit"></use></svg></button>
+        </div>
+      </div>
+
+      <div class="canvas" id="canvas">
+        <div class="empty" id="empty">
+          <div class="empty-art" aria-hidden="true">
+            <svg viewBox="0 0 184 114" fill="none">
+              <path d="M41 21h116v75H41z" stroke="#333e49"/>
+              <path d="M23 11h127v84H23z" fill="#171e26" stroke="#546273"/>
+              <path d="m24 83 31-32 21 15 27-35 46 48v15H24z" fill="#243544"/>
+              <path d="m24 83 31-32 21 15 27-35 46 48m-56-6 10-13 19 17" stroke="#617b89"/>
+              <circle cx="54" cy="37" r="8" fill="#cda575" fill-opacity=".74"/>
+              <path d="M17 28V5h23m93 0h23v23m0 50v23h-23m-93 0H17V78" stroke="#be9b72"/>
+              <path d="M83 108h25m-12-4v8" stroke="#687787"/>
+            </svg>
+          </div>
+          <h2>打开一张照片</h2>
+          <p>将照片拖到这里，或从电脑选择文件。</p>
+          <button class="button outline" id="empty-open"><svg><use href="#i-plus"></use></svg>选择照片</button>
+          <span class="empty-note">支持常见图片格式与可解码的相机 RAW</span>
+        </div>
+
+        <div class="view" id="view" tabindex="0" aria-label="照片画布，按住空格暂看原图" hidden>
+          <div class="photo-stack" id="photo-stack">
+            <img id="image-edited" alt="修图后效果" draggable="false">
+            <img id="image-original" alt="原图" draggable="false">
+            <div class="skin-overlay" id="skin-overlay" hidden></div>
+            <div class="compare-ui" id="compare-ui">
+              <div class="compare-line" aria-hidden="true"><span><svg><use href="#i-arrow"></use></svg></span></div>
+              <span class="image-label before">原图</span>
+              <span class="image-label after">效果</span>
+              <input id="split" type="range" min="0" max="100" value="50" aria-label="调整原图和效果的对比分隔位置">
+            </div>
+          </div>
+        </div>
+        <div class="drop-hint" id="drop-hint" hidden>松开即可导入照片</div>
+        <span class="peek-label image-label" id="peek-label" hidden>原图</span>
+        <span class="render-chip" id="render-chip" hidden>正在生成预览</span>
+      </div>
+
+      <section class="filmstrip" aria-label="照片胶片带">
+        <div class="film-head"><strong>照片</strong><span id="photo-count">0 张</span></div>
+        <div class="film-items" id="film-items"></div>
+        <button class="film-add" id="film-add" type="button" aria-label="添加照片" title="添加照片"><svg><use href="#i-plus"></use></svg></button>
+      </section>
+    </section>
+
+    <aside class="inspector" aria-label="照片调整与项目">
+      <div class="inspector-heading">
+        <div><h2 id="inspector-title">调色</h2><p id="inspector-caption">先调整原片，再应用风格，最后微调成片。</p></div>
+        <button class="icon-button" id="reset-photo" type="button" title="重置当前照片" aria-label="重置当前照片" disabled><svg><use href="#i-reset"></use></svg></button>
+      </div>
+      <div class="inspector-scroll">
+        <section id="panel-landscape" class="tool-panel" aria-labelledby="inspector-title"></section>
+        <section id="panel-portrait" class="tool-panel" aria-labelledby="inspector-title" hidden></section>
+        <section id="panel-styles" class="tool-panel" aria-labelledby="inspector-title" hidden>
+          <div class="section-heading"><h3>基础调色</h3><button class="button small outline" type="button" id="show-base">返回基础调色</button></div>
+          <div class="section-heading workflow-link"><h3>应用风格</h3><button class="button small outline" id="import-lut"><svg><use href="#i-plus"></use></svg>导入 LUT</button></div>
+          <p class="section-note">导入社区 .cube LUT。Chromora 在 sRGB 中应用色表，请选择 sRGB 兼容的 LUT。</p>
+          <div class="filter-tools"><button type="button" class="button small outline" id="filter-all" aria-pressed="true">全部</button><button type="button" class="button small outline" id="filter-favorites" aria-pressed="false"><svg><use href="#i-star"></use></svg>收藏</button></div>
+          <div id="lut-list" class="lut-list"></div>
+          <div id="style-sliders"></div>
+          <p class="section-note">富士、理光的机内配方可先转换成兼容色表，再在这里应用。颗粒、锐化等需单独调整。</p>
+        </section>
+        <section id="panel-project" class="tool-panel" aria-labelledby="inspector-title" hidden>
+          <div class="section-heading"><h3>本地项目</h3></div>
+          <label class="field">项目名称<input id="project-name" maxlength="80" autocomplete="off" value="未命名项目"></label>
+          <div class="two-buttons">
+            <button type="button" class="button outline" id="project-open"><svg><use href="#i-open"></use></svg>打开项目</button>
+            <button type="button" class="button primary" id="project-save" disabled>保存项目</button>
+          </div>
+          <p class="section-note" id="project-info">保存照片与调整参数，可继续编辑。</p>
+          <div class="section-heading"><h3>外部精修</h3></div>
+          <button type="button" class="button outline wide" id="patchy-open" disabled>在 Patchy 中精修</button>
+          <p class="section-note">将当前效果交给已配置的 Patchy，用于图层、选区、蒙版及手工修饰。</p>
+          <div class="section-heading"><h3>处理状态</h3></div>
+          <ul class="capabilities" id="capabilities"><li>正在连接本机服务</li></ul>
+        </section>
+      </div>
+    </aside>
+  </main>
+
+  <footer class="statusbar">
+    <span class="status-dot" id="status-dot"></span>
+    <span id="status" role="status" aria-live="polite">正在连接本机服务</span>
+    <span class="footer-meta" id="footer-meta">仅在本机处理</span>
+  </footer>
+
+  <dialog id="export-dialog" aria-labelledby="export-title">
+    <form id="export-form">
+      <div class="dialog-title"><h2 id="export-title">导出照片</h2><button type="button" id="export-close" class="icon-button" aria-label="关闭导出">×</button></div>
+      <label class="field">格式<select id="export-format"><option value="jpeg">JPG</option><option value="tiff">16 位 TIFF</option><option value="psd">PSD</option></select></label>
+      <p id="format-note" class="section-note"></p><p id="export-result" class="export-result" role="status" hidden></p>
+      <p class="dialog-error" id="export-error" role="alert" hidden></p>
+      <div class="dialog-actions"><button type="button" class="button outline" id="export-cancel">取消</button><button type="submit" class="button primary" id="export-submit">导出照片</button></div>
+    </form>
+  </dialog>
+
+  <input id="file-input" type="file" multiple hidden>
+  <input id="folder-input" type="file" webkitdirectory multiple hidden>
+  <input id="lut-input" type="file" accept=".cube" hidden>
+  <dialog id="project-dialog" aria-labelledby="project-dialog-title">
+    <form id="project-form">
+      <div class="dialog-title"><h2 id="project-dialog-title">打开项目</h2><button type="button" id="project-close" class="icon-button" aria-label="关闭">×</button></div>
+      <label class="field">已保存项目<select id="project-picker" required></select></label>
+      <div class="dialog-actions"><button type="submit" id="project-load" class="button primary" disabled>打开项目</button></div>
+    </form>
+  </dialog>
+</body>
+</html>
