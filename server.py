@@ -75,13 +75,15 @@ def original_path(photo_id: str) -> Path:
     return path
 
 
-def validate_project_state(state: dict) -> None:
+def validate_project_state(state: dict, *, check_originals: bool = False) -> None:
     photos = state.get("photos")
     if not isinstance(photos, list):
         raise ValueError("工程中的照片列表无效。")
     for index, photo in enumerate(photos):
         if not isinstance(photo, dict):
             raise ValueError(f"工程中的第 {index + 1} 张照片数据无效。")
+        if check_originals:
+            original_path(photo.get("id"))
         settings = photo.get("settings", {})
         if not isinstance(settings, dict):
             raise ValueError(f"工程中的第 {index + 1} 张照片调整参数无效。")
@@ -253,7 +255,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             state = stored.get("state")
             if not isinstance(state, dict):
                 raise ValueError("工程数据有误。")
-            validate_project_state(state)
+            validate_project_state(state, check_originals=True)
             self.json(stored)
         else:
             self.json({"error": "地址不存在。"}, HTTPStatus.NOT_FOUND)

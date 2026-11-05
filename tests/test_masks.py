@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -143,6 +144,22 @@ class MaskWeightTests(unittest.TestCase):
         }]}
         with self.assertRaises(ValueError):
             server.validate_project_state(invalid_mask_project)
+
+    def test_project_preflight_rejects_missing_originals(self):
+        valid_id = "a" * 64 + ".jpg"
+        missing_id = "b" * 64 + ".jpg"
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(server, "PHOTOS", Path(directory)):
+                (Path(directory) / valid_id).write_bytes(b"image")
+                server.validate_project_state(
+                    {"photos": [{"id": valid_id, "settings": {}}]},
+                    check_originals=True,
+                )
+                with self.assertRaises(FileNotFoundError):
+                    server.validate_project_state(
+                        {"photos": [{"id": missing_id, "settings": {}}]},
+                        check_originals=True,
+                    )
 
 
 if __name__ == "__main__":
